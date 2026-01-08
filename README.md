@@ -1,6 +1,6 @@
 # LTX-2-MLX
 
-Native Apple Silicon implementation of [Lightricks LTX-2](https://github.com/Lightricks/LTX-Video), a 19B parameter video generation model, using MLX.
+Native Apple Silicon implementation of [Lightricks LTX-2](https://github.com/Lightricks/LTX-2), a 19B parameter video generation model, using MLX.
 
 ## Features
 
