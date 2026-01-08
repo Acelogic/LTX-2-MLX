@@ -59,7 +59,7 @@ def create_dummy_text_encoding(
     prompt: str,
     batch_size: int = 1,
     max_tokens: int = 256,
-    embed_dim: int = 3840,  # Gemma output dimension
+    embed_dim: int = 4096,  # Cross-attention dimension (after projection)
 ) -> tuple:
     """
     Create dummy text encoding for testing.
@@ -69,11 +69,34 @@ def create_dummy_text_encoding(
     # For now, use random but deterministic encoding based on prompt
     mx.random.seed(hash(prompt) % (2**31))
 
-    # Create text embeddings
+    # Create text embeddings in cross-attention dimension
     text_encoding = mx.random.normal(shape=(batch_size, max_tokens, embed_dim)) * 0.1
     text_mask = mx.ones((batch_size, max_tokens))
 
     return text_encoding, text_mask
+
+
+def load_text_embedding(embedding_path: str) -> tuple:
+    """
+    Load pre-computed text embedding from file.
+
+    Args:
+        embedding_path: Path to .npz file with embedding and attention_mask.
+
+    Returns:
+        Tuple of (embedding, attention_mask).
+    """
+    data = np.load(embedding_path)
+    embedding = mx.array(data["embedding"])
+    mask = mx.array(data["attention_mask"])
+
+    print(f"  Loaded embedding from {embedding_path}")
+    print(f"  Shape: {embedding.shape}")
+
+    if "prompt" in data:
+        print(f"  Original prompt: {data['prompt']}")
+
+    return embedding, mask
 
 
 def load_vae_decoder(weights_path: str) -> VideoDecoder:
@@ -160,6 +183,7 @@ def generate_video(
     output_path: str = "output.mp4",
     use_placeholder: bool = False,
     skip_vae: bool = False,
+    embedding_path: str = None,
 ):
     """Generate video from text prompt."""
 
@@ -171,6 +195,8 @@ def generate_video(
     print(f"Steps: {num_steps}, CFG: {cfg_scale}, Seed: {seed}")
     if skip_vae:
         print(f"VAE decoding: SKIPPED")
+    if embedding_path:
+        print(f"Using pre-computed embedding: {embedding_path}")
 
     # Set seed
     mx.random.seed(seed)
@@ -183,10 +209,13 @@ def generate_video(
 
     print(f"\nLatent shape: {latent_frames}x{latent_height}x{latent_width}")
 
-    # Create dummy text encoding
+    # Get text encoding
     print("\n[1/5] Encoding prompt...")
-    text_encoding, text_mask = create_dummy_text_encoding(prompt)
-    print("  Using dummy encoding (Gemma integration pending)")
+    if embedding_path:
+        text_encoding, text_mask = load_text_embedding(embedding_path)
+    else:
+        text_encoding, text_mask = create_dummy_text_encoding(prompt)
+        print("  Using dummy encoding (Gemma integration pending)")
 
     # Load model
     print("\n[2/5] Loading transformer...")
@@ -414,6 +443,12 @@ def main():
         action="store_true",
         help="Skip VAE decoding (output latent visualization instead)"
     )
+    parser.add_argument(
+        "--embedding",
+        type=str,
+        default=None,
+        help="Path to pre-computed text embedding (.npz)"
+    )
 
     args = parser.parse_args()
 
@@ -429,6 +464,7 @@ def main():
         output_path=args.output,
         use_placeholder=args.placeholder,
         skip_vae=args.skip_vae,
+        embedding_path=args.embedding,
     )
 
 
