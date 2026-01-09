@@ -59,17 +59,18 @@ def create_dummy_text_encoding(
     prompt: str,
     batch_size: int = 1,
     max_tokens: int = 256,
-    embed_dim: int = 4096,  # Cross-attention dimension (after projection)
+    embed_dim: int = 3840,  # Pre-projection dimension (transformer does its own projection)
 ) -> tuple:
     """
     Create dummy text encoding for testing.
 
     In production, this should be replaced with actual Gemma encoding.
+    Note: Output is 3840-dim because the transformer has its own caption_projection.
     """
     # For now, use random but deterministic encoding based on prompt
     mx.random.seed(hash(prompt) % (2**31))
 
-    # Create text embeddings in cross-attention dimension
+    # Create text embeddings in pre-projection dimension
     text_encoding = mx.random.normal(shape=(batch_size, max_tokens, embed_dim)) * 0.1
     text_mask = mx.ones((batch_size, max_tokens))
 
