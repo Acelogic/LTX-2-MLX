@@ -107,19 +107,23 @@ LTX-2 requires frames to satisfy `frames % 8 == 1`:
 
 ## Text Encoding Options
 
-### Option 1: Pre-computed Embeddings (Recommended)
+### Option 1: Native MLX Encoding (Recommended)
 
-Use the PyTorch script to generate embeddings with the official LTX-2 encoder:
+Use the native MLX pipeline with Gemma 3 12B:
 
 ```bash
-# Requires: pip install torch transformers safetensors
-# Requires: Gemma 3 12B safetensors in weights/gemma-3-12b/
+# Step 1: Download Gemma 3 12B (requires HuggingFace token)
+python scripts/download_gemma.py
 
-python scripts/encode_with_pytorch.py "Your prompt here" \
+# Step 2: Encode your prompt
+python scripts/encode_text_mlx.py "A cat walking through a garden" \
     --gemma-path weights/gemma-3-12b \
+    --ltx-weights weights/ltx-2/ltx-2-19b-distilled.safetensors \
     --output prompt_embedding.npz
 
-python scripts/generate.py --embedding prompt_embedding.npz
+# Step 3: Generate video
+python scripts/generate.py --embedding prompt_embedding.npz \
+    --height 480 --width 704 --frames 25 --steps 5
 ```
 
 ### Option 2: Dummy Embeddings (Testing)
@@ -128,6 +132,16 @@ For testing without Gemma, the pipeline uses deterministic random embeddings:
 
 ```bash
 python scripts/generate.py "A cat walking" --height 128 --width 128
+```
+
+### Option 3: PyTorch Encoding (Alternative)
+
+Use PyTorch with the official LTX-2 text encoder (requires triton):
+
+```bash
+python scripts/encode_with_pytorch.py "Your prompt here" \
+    --gemma-path weights/gemma-3-12b \
+    --output prompt_embedding.npz
 ```
 
 ### Downloading Gemma 3 12B
@@ -151,22 +165,22 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 ## Current Status
 
 ### Working
-- Transformer forward pass with loaded weights
+- Full end-to-end text-to-video generation
+- Native MLX Gemma 3 12B text encoder
+- Transformer forward pass with loaded weights (19B parameters)
 - VAE decoder with weight loading
-- Text encoder components with weight loading
-- End-to-end generation pipeline
 - Video export via ffmpeg
+- Tested at 480x704 resolution
+
+### Performance (M3 Max 128GB)
+- 128x128, 3 steps: ~16s
+- 256x256, 5 steps: ~26s
+- 480x704, 5 steps: ~56s
 
 ### Pending
-- Gemma language model integration (currently using dummy embeddings)
-- Full resolution inference optimization
 - Memory optimization for longer videos
-
-## Performance
-
-On M3 Max (128GB):
-- 128×128, 3 steps: ~15s
-- Higher resolutions scale with sequence length
+- Image-to-video conditioning
+- LoRA support
 
 ## License
 
