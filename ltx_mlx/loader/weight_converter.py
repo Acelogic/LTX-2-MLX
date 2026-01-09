@@ -310,7 +310,12 @@ def load_transformer_weights(
     """
     from safetensors import safe_open
 
-    print(f"Loading weights from {weights_path}...")
+    try:
+        from tqdm import tqdm
+        has_tqdm = True
+    except ImportError:
+        has_tqdm = False
+        print(f"Loading weights from {weights_path}...")
 
     # Build the weights dictionary for model.update()
     weights_dict = {}
@@ -318,7 +323,13 @@ def load_transformer_weights(
     skipped_count = 0
 
     with safe_open(weights_path, framework="pt") as f:
-        for pytorch_key in f.keys():
+        all_keys = list(f.keys())
+        if has_tqdm:
+            key_iter = tqdm(all_keys, desc="Loading transformer", ncols=80)
+        else:
+            key_iter = all_keys
+
+        for pytorch_key in key_iter:
             # Only process diffusion model keys
             if not pytorch_key.startswith("model.diffusion_model."):
                 continue

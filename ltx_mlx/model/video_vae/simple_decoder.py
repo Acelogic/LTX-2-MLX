@@ -210,31 +210,53 @@ class SimpleVideoDecoder(nn.Module):
         # Scale/shift for final norm (not fully used in simplified version)
         self.last_scale_shift_table = mx.zeros((2, 128))
 
-    def __call__(self, latent: mx.array) -> mx.array:
+    def __call__(self, latent: mx.array, show_progress: bool = True) -> mx.array:
         """
         Decode latent to video.
 
         Args:
             latent: Latent tensor (B, 128, T, H, W).
+            show_progress: Whether to show progress bar.
 
         Returns:
             Video tensor (B, 3, T*8, H*32, W*32).
         """
+        try:
+            from tqdm import tqdm
+            has_tqdm = show_progress
+        except ImportError:
+            has_tqdm = False
+
+        def step(x, block, desc):
+            x = block(x, causal=True)
+            mx.eval(x)
+            if has_tqdm:
+                pbar.update(1)
+                pbar.set_description(desc)
+            return x
+
+        if has_tqdm:
+            pbar = tqdm(total=10, desc="VAE decode", ncols=80)
+
         # Denormalize latent using per-channel statistics
         x = latent * self.std_of_means[None, :, None, None, None]
         x = x + self.mean_of_means[None, :, None, None, None]
 
         # Conv in
         x = self.conv_in(x, causal=True)
+        mx.eval(x)
+        if has_tqdm:
+            pbar.update(1)
+            pbar.set_description("conv_in done")
 
-        # Up blocks
-        x = self.up_blocks_0(x, causal=True)
-        x = self.up_blocks_1(x, causal=True)  # 2x2x2 upsample
-        x = self.up_blocks_2(x, causal=True)
-        x = self.up_blocks_3(x, causal=True)  # 2x2x2 upsample
-        x = self.up_blocks_4(x, causal=True)
-        x = self.up_blocks_5(x, causal=True)  # 2x2x2 upsample
-        x = self.up_blocks_6(x, causal=True)
+        # Up blocks with progress
+        x = step(x, self.up_blocks_0, "res_blocks 1/4")
+        x = step(x, self.up_blocks_1, "upsample 1/3")
+        x = step(x, self.up_blocks_2, "res_blocks 2/4")
+        x = step(x, self.up_blocks_3, "upsample 2/3")
+        x = step(x, self.up_blocks_4, "res_blocks 3/4")
+        x = step(x, self.up_blocks_5, "upsample 3/3")
+        x = step(x, self.up_blocks_6, "res_blocks 4/4")
 
         # Final norm and activation
         x = _pixel_norm(x)
@@ -245,9 +267,18 @@ class SimpleVideoDecoder(nn.Module):
 
         # Conv out
         x = self.conv_out(x, causal=True)
+        mx.eval(x)
+        if has_tqdm:
+            pbar.update(1)
+            pbar.set_description("conv_out done")
 
         # Unpatchify: (B, 48, T, H, W) -> (B, 3, T, H*4, W*4)
         x = unpatchify(x, patch_size_hw=4, patch_size_t=1)
+        mx.eval(x)
+        if has_tqdm:
+            pbar.update(1)
+            pbar.set_description("unpatchify done")
+            pbar.close()
 
         return x
 
