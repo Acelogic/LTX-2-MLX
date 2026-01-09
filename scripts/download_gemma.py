@@ -22,7 +22,7 @@ import os
 from pathlib import Path
 
 
-def download_gemma(token: str, output_dir: str = "weights/gemma-3-12b"):
+def download_gemma(token: str = None, output_dir: str = "weights/gemma-3-12b"):
     """Download Gemma 3 12B safetensors."""
     try:
         from huggingface_hub import snapshot_download
@@ -44,11 +44,11 @@ def download_gemma(token: str, output_dir: str = "weights/gemma-3-12b"):
     print()
 
     try:
-        # Download the full model
+        # Download the full model (token=True uses cached token)
         local_dir = snapshot_download(
             repo_id=repo_id,
             local_dir=output_dir,
-            token=token,
+            token=token if token else True,
             allow_patterns=[
                 "*.safetensors",
                 "config.json",
@@ -94,18 +94,6 @@ def main():
     )
 
     args = parser.parse_args()
-
-    if not args.token:
-        print("Error: HuggingFace token required.")
-        print()
-        print("Get a token at: https://huggingface.co/settings/tokens")
-        print()
-        print("Then either:")
-        print("  python scripts/download_gemma.py --token YOUR_TOKEN")
-        print("Or:")
-        print("  export HF_TOKEN=your_token")
-        print("  python scripts/download_gemma.py")
-        return
 
     download_gemma(args.token, args.output)
 
