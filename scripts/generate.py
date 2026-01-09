@@ -2,6 +2,7 @@
 """Generate video from text prompt using LTX-2 MLX."""
 
 import argparse
+import gc
 import os
 import sys
 from pathlib import Path
@@ -187,6 +188,19 @@ def encode_with_gemma(
 
     print(f"  Output embedding shape: {encoded.shape}")  # Should be [B, T, 3840]
 
+    # === MEMORY OPTIMIZATION ===
+    # Clear Gemma and text encoder from memory after encoding
+    # These are large models (~12GB for Gemma FP16) that are no longer needed
+    print(f"  Clearing Gemma from memory...")
+    del gemma
+    del text_encoder
+    del all_hidden_states
+    del last_hidden
+    del tokenizer
+    gc.collect()
+    # Force MLX to release memory
+    mx.metal.clear_cache()
+
     return encoded, binary_mask
 
 
@@ -288,9 +302,14 @@ def load_vae_decoder(weights_path: str) -> VideoDecoder:
     return decoder
 
 
-def load_transformer(weights_path: str, num_layers: int = 48) -> LTXModel:
+def load_transformer(
+    weights_path: str,
+    num_layers: int = 48,
+    compute_dtype: mx.Dtype = mx.float32,
+) -> LTXModel:
     """Load transformer with weights."""
-    print("Loading transformer...")
+    dtype_name = "FP16" if compute_dtype == mx.float16 else "FP32"
+    print(f"Loading transformer ({dtype_name})...")
 
     model = LTXModel(
         model_type=LTXModelType.VideoOnly,
@@ -302,6 +321,7 @@ def load_transformer(weights_path: str, num_layers: int = 48) -> LTXModel:
         cross_attention_dim=4096,
         caption_channels=3840,
         positional_embedding_theta=10000.0,
+        compute_dtype=compute_dtype,
     )
 
     # Load weights
@@ -340,6 +360,7 @@ def generate_video(
     embedding_path: str = None,
     gemma_path: str = "weights/gemma-3-12b",
     use_gemma: bool = True,
+    use_fp16: bool = False,
 ):
     """Generate video from text prompt."""
 
@@ -348,12 +369,17 @@ def generate_video(
     if output_dir:
         os.makedirs(output_dir, exist_ok=True)
 
+    # Determine compute dtype
+    compute_dtype = mx.float16 if use_fp16 else mx.float32
+
     print(f"\n{'='*50}")
     print(f"LTX-2 MLX Video Generation")
     print(f"{'='*50}")
     print(f"Prompt: {prompt}")
     print(f"Resolution: {width}x{height}, {num_frames} frames")
     print(f"Steps: {num_steps}, CFG: {cfg_scale}, Seed: {seed}")
+    if use_fp16:
+        print(f"Compute dtype: FP16 (memory optimized)")
     if skip_vae:
         print(f"VAE decoding: SKIPPED")
     if embedding_path:
@@ -411,7 +437,7 @@ def generate_video(
     # Load model
     print("\n[2/5] Loading transformer...")
     if not use_placeholder and weights_path:
-        model = load_transformer(weights_path, num_layers=48)
+        model = load_transformer(weights_path, num_layers=48, compute_dtype=compute_dtype)
     else:
         model = None
         print("  Skipping model load (placeholder mode)")
@@ -424,8 +450,9 @@ def generate_video(
     # Load VAE decoder
     vae_decoder = None
     if not skip_vae and weights_path:
-        print("\n[3/5] Loading VAE decoder...")
-        vae_decoder = SimpleVideoDecoder()
+        dtype_name = "FP16" if use_fp16 else "FP32"
+        print(f"\n[3/5] Loading VAE decoder ({dtype_name})...")
+        vae_decoder = SimpleVideoDecoder(compute_dtype=compute_dtype)
         load_vae_decoder_weights(vae_decoder, weights_path)
     elif not skip_vae:
         print("\n[3/5] Skipping VAE decoder (no weights)")
@@ -675,6 +702,11 @@ def main():
         action="store_true",
         help="Use dummy embeddings instead of real Gemma encoding (for testing)"
     )
+    parser.add_argument(
+        "--fp16",
+        action="store_true",
+        help="Use FP16 computation for lower memory usage (~50%% reduction)"
+    )
 
     args = parser.parse_args()
 
@@ -693,6 +725,7 @@ def main():
         embedding_path=args.embedding,
         gemma_path=args.gemma_path,
         use_gemma=not args.no_gemma,
+        use_fp16=args.fp16,
     )
 
 

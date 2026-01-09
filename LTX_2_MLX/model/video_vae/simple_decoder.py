@@ -368,8 +368,9 @@ class SimpleVideoDecoder(nn.Module):
     Total upsampling: 8x temporal, 8x spatial from d2s + 4x spatial from unpatchify = 32x spatial
     """
 
-    def __init__(self):
+    def __init__(self, compute_dtype: mx.Dtype = mx.float32):
         super().__init__()
+        self.compute_dtype = compute_dtype
 
         # Per-channel statistics for denormalization
         self.mean_of_means = mx.zeros((128,))
@@ -427,6 +428,10 @@ class SimpleVideoDecoder(nn.Module):
             tqdm = None
 
         batch_size = latent.shape[0]
+
+        # Cast to compute dtype for memory efficiency
+        if self.compute_dtype != mx.float32:
+            latent = latent.astype(self.compute_dtype)
 
         # Compute scaled timestep
         scaled_timestep = None
@@ -513,6 +518,10 @@ class SimpleVideoDecoder(nn.Module):
             pbar.update(1)
             pbar.set_description("unpatchify done")
             pbar.close()
+
+        # Cast output back to float32 for video export
+        if self.compute_dtype != mx.float32:
+            x = x.astype(mx.float32)
 
         return x
 

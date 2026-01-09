@@ -40,18 +40,19 @@ def patchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.array
         x = x.reshape(b, c * r * q, h // q, w // r)
 
     elif x.ndim == 5:
-        # 5D: (B, C, F, H, W) -> (B, C*p*r*q, F/p, H/q, W/r)
+        # 5D: (B, C, F, H, W) -> (B, C*p*q*r, F/p, H/q, W/r)
         b, c, f, h, w = x.shape
         p = patch_size_t
-        q = patch_size_hw
-        r = patch_size_hw
+        q = patch_size_hw  # r_h (height factor)
+        r = patch_size_hw  # r_w (width factor)
 
         # Reshape: (B, C, F, H, W) -> (B, C, F/p, p, H/q, q, W/r, r)
         x = x.reshape(b, c, f // p, p, h // q, q, w // r, r)
-        # Transpose: -> (B, C, p, r, q, F/p, H/q, W/r)
-        x = x.transpose(0, 1, 3, 7, 5, 2, 4, 6)
-        # Reshape: -> (B, C*p*r*q, F/p, H/q, W/r)
-        x = x.reshape(b, c * p * r * q, f // p, h // q, w // r)
+        # Transpose: -> (B, C, p, q, r, F/p, H/q, W/r)
+        # Pack channels as (C, p, r_h, r_w) to match unpatchify
+        x = x.transpose(0, 1, 3, 5, 7, 2, 4, 6)
+        # Reshape: -> (B, C*p*q*r, F/p, H/q, W/r)
+        x = x.reshape(b, c * p * q * r, f // p, h // q, w // r)
 
     else:
         raise ValueError(f"Invalid input shape: {x.shape}, expected 4D or 5D")

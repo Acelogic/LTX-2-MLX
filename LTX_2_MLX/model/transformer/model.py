@@ -265,6 +265,7 @@ class LTXModel(nn.Module):
         timestep_scale_multiplier: int = 1000,
         use_middle_indices_grid: bool = True,
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        compute_dtype: mx.Dtype = mx.float32,
     ):
         """
         Initialize LTX model.
@@ -284,6 +285,7 @@ class LTXModel(nn.Module):
             timestep_scale_multiplier: Scale for timestep (1000).
             use_middle_indices_grid: Use middle of position bounds for RoPE.
             rope_type: Type of RoPE (INTERLEAVED).
+            compute_dtype: Dtype for computation (float32 or float16).
         """
         super().__init__()
 
@@ -296,6 +298,7 @@ class LTXModel(nn.Module):
         self.positional_embedding_theta = positional_embedding_theta
         self.use_middle_indices_grid = use_middle_indices_grid
         self.norm_eps = norm_eps
+        self.compute_dtype = compute_dtype
 
         if positional_embedding_max_pos is None:
             positional_embedding_max_pos = [20, 2048, 2048]
@@ -360,8 +363,12 @@ class LTXModel(nn.Module):
         Returns:
             Updated TransformerArgs after all blocks.
         """
-        for block in self.transformer_blocks:
+        for i, block in enumerate(self.transformer_blocks):
             args = block(args)
+            # Force evaluation every 8 layers to release intermediate tensors
+            # This reduces peak memory by preventing lazy evaluation buildup
+            if (i + 1) % 8 == 0:
+                mx.eval(args.x)
         return args
 
     def _process_output(
@@ -410,6 +417,17 @@ class LTXModel(nn.Module):
         Returns:
             Velocity predictions, shape (B, T, out_channels).
         """
+        # Cast input to compute dtype for memory efficiency
+        if self.compute_dtype != mx.float32:
+            video = Modality(
+                latent=video.latent.astype(self.compute_dtype),
+                context=video.context.astype(self.compute_dtype),
+                context_mask=video.context_mask,
+                timesteps=video.timesteps,
+                positions=video.positions,
+                enabled=video.enabled,
+            )
+
         # Preprocess inputs
         args = self._video_args_preprocessor.prepare(video)
 
@@ -418,6 +436,10 @@ class LTXModel(nn.Module):
 
         # Process output
         output = self._process_output(args.x, args.embedded_timestep)
+
+        # Cast output back to float32 for numerical stability in diffusion steps
+        if self.compute_dtype != mx.float32:
+            output = output.astype(mx.float32)
 
         return output
 
