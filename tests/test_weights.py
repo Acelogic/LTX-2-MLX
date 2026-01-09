@@ -6,7 +6,7 @@ import mlx.core as mx
 
 def test_key_conversion():
     """Test PyTorch to MLX key conversion."""
-    from ltx_mlx.loader import (
+    from LTX_2_MLX.loader import (
         convert_transformer_key,
         convert_vae_key,
         convert_text_encoder_key,
@@ -52,7 +52,7 @@ def test_key_conversion():
 
 def test_weight_transposition():
     """Test linear weight transposition."""
-    from ltx_mlx.loader import transpose_linear_weights
+    from LTX_2_MLX.loader import transpose_linear_weights
 
     weights = {
         "layer.weight": mx.zeros((64, 128)),  # PyTorch [out, in]
@@ -73,7 +73,7 @@ def test_weight_transposition():
 
 def test_weight_extraction():
     """Test weight extraction functions."""
-    from ltx_mlx.loader import extract_transformer_weights, extract_vae_weights
+    from LTX_2_MLX.loader import extract_transformer_weights, extract_vae_weights
 
     # Create mock weights
     mock_weights = {
@@ -117,7 +117,7 @@ def test_load_real_weights():
         print("  Skipping real weight loading (no weight files found)")
         return
 
-    from ltx_mlx.loader import load_safetensors
+    from LTX_2_MLX.loader import load_safetensors
 
     # Try loading weights (only load a sample to avoid memory issues)
     print(f"  Loading weights from {weights_path}...")

@@ -27,8 +27,8 @@ import numpy as np
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ltx_mlx.model.text_encoder.gemma3 import create_gemma3_model, Gemma3Config
-from ltx_mlx.model.text_encoder.encoder import (
+from LTX_2_MLX.model.text_encoder.gemma3 import create_gemma3_model, Gemma3Config
+from LTX_2_MLX.model.text_encoder.encoder import (
     VideoGemmaTextEncoderModel,
     create_text_encoder,
     load_text_encoder_weights,
@@ -115,7 +115,7 @@ def encode_prompt(
 
     # Step 1: Feature extraction from hidden states
     stacked = mx.stack(hidden_states, axis=-1)  # [B, T, D, L]
-    from ltx_mlx.model.text_encoder.feature_extractor import norm_and_concat_padded_batch
+    from LTX_2_MLX.model.text_encoder.feature_extractor import norm_and_concat_padded_batch
     sequence_lengths = attention_mask.sum(axis=-1).astype(mx.int32)
     normed = norm_and_concat_padded_batch(stacked, sequence_lengths, padding_side="right")
     projected = text_encoder.feature_extractor.aggregate_embed(normed)

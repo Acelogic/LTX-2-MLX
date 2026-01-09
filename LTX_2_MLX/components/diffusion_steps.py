@@ -4,7 +4,7 @@ from typing import Protocol, Union
 
 import mlx.core as mx
 
-from ltx_mlx.utils import to_velocity
+from LTX_2_MLX.utils import to_velocity
 
 
 class DiffusionStepProtocol(Protocol):

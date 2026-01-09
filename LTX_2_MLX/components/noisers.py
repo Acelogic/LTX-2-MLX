@@ -4,7 +4,7 @@ from typing import Optional, Protocol
 
 import mlx.core as mx
 
-from ltx_mlx.types import LatentState
+from LTX_2_MLX.types import LatentState
 
 
 class NoiserProtocol(Protocol):

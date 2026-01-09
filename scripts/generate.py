@@ -12,20 +12,29 @@ import numpy as np
 # Add parent to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from ltx_mlx.model.transformer import (
+from LTX_2_MLX.model.transformer import (
     LTXModel,
     LTXModelType,
     Modality,
     create_position_grid,
 )
-from ltx_mlx.model.video_vae import VideoDecoder, NormLayerType
-from ltx_mlx.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier
-from ltx_mlx.types import VideoLatentShape
-from ltx_mlx.loader import load_transformer_weights
-from ltx_mlx.model.video_vae.simple_decoder import (
+from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
+from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier
+from LTX_2_MLX.types import VideoLatentShape
+from LTX_2_MLX.loader import load_transformer_weights
+from LTX_2_MLX.model.video_vae.simple_decoder import (
     SimpleVideoDecoder,
     load_vae_decoder_weights,
     decode_latent,
+)
+from LTX_2_MLX.model.text_encoder.gemma3 import (
+    Gemma3Config,
+    Gemma3Model,
+    load_gemma3_weights,
+)
+from LTX_2_MLX.model.text_encoder.encoder import (
+    create_text_encoder,
+    load_text_encoder_weights,
 )
 
 # Try to import tqdm for progress bars
@@ -55,6 +64,132 @@ def _simple_progress(iterable, desc, total):
     print()  # newline after completion
 
 
+# LTX-2 system prompt for video generation
+T2V_SYSTEM_PROMPT = """Describe the video in extreme detail, focusing on the visual content, without any introductory phrases."""
+
+
+def load_tokenizer(model_path: str):
+    """Load the Gemma tokenizer from HuggingFace transformers."""
+    try:
+        from transformers import AutoTokenizer
+        tokenizer = AutoTokenizer.from_pretrained(model_path)
+        return tokenizer
+    except ImportError:
+        print("Error: transformers library required for tokenizer")
+        print("Install with: pip install transformers")
+        return None
+
+
+def create_chat_prompt(user_prompt: str) -> str:
+    """Create a chat-format prompt for Gemma 3."""
+    # Gemma 3 instruction-tuned format
+    chat = f"<bos><start_of_turn>user\n{T2V_SYSTEM_PROMPT}\n{user_prompt}<end_of_turn>\n<start_of_turn>model\n"
+    return chat
+
+
+def encode_with_gemma(
+    prompt: str,
+    gemma_path: str,
+    ltx_weights_path: str,
+    max_length: int = 256,
+) -> tuple:
+    """
+    Encode a text prompt using the full Gemma 3 + LTX-2 text encoder pipeline.
+
+    Args:
+        prompt: Text prompt to encode.
+        gemma_path: Path to Gemma 3 weights directory.
+        ltx_weights_path: Path to LTX-2 weights (for text encoder projection).
+        max_length: Maximum token length.
+
+    Returns:
+        Tuple of (embedding, attention_mask) as MLX arrays.
+    """
+    print(f"  Loading tokenizer from {gemma_path}...")
+    tokenizer = load_tokenizer(gemma_path)
+    if tokenizer is None:
+        return None, None
+
+    # CRITICAL: Use right padding to avoid NaN in attention
+    # Left padding causes all-inf attention rows for padding positions
+    tokenizer.padding_side = "right"
+
+    print(f"  Loading Gemma 3 model...")
+    config = Gemma3Config()
+    gemma = Gemma3Model(config)
+    load_gemma3_weights(gemma, gemma_path)
+
+    print(f"  Loading text encoder projection...")
+    text_encoder = create_text_encoder()
+    load_text_encoder_weights(text_encoder, ltx_weights_path)
+
+    # Create chat format prompt
+    chat_prompt = create_chat_prompt(prompt)
+
+    # Tokenize
+    print(f"  Tokenizing prompt...")
+    encoding = tokenizer(
+        chat_prompt,
+        return_tensors="np",
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+    )
+
+    input_ids = mx.array(encoding["input_ids"])
+    attention_mask = mx.array(encoding["attention_mask"])
+
+    num_tokens = int(attention_mask.sum())
+    print(f"  Token count: {num_tokens}/{max_length}")
+
+    # Run through Gemma to get hidden states
+    print(f"  Running Gemma 3 forward pass (48 layers)...")
+    last_hidden, all_hidden_states = gemma(
+        input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+    )
+    mx.eval(last_hidden)
+
+    if all_hidden_states is None:
+        print("  Error: Gemma model did not return hidden states")
+        return None, None
+
+    print(f"  Got {len(all_hidden_states)} hidden states")
+
+    # Run through text encoder pipeline (feature extraction + connector only)
+    # Note: We skip caption_projection here because the transformer has its own
+    print(f"  Processing through text encoder pipeline...")
+
+    # Feature extraction
+    encoded = text_encoder.feature_extractor.extract_from_hidden_states(
+        hidden_states=all_hidden_states,
+        attention_mask=attention_mask,
+        padding_side="right",
+    )
+
+    # Convert mask to additive format
+    large_value = 1e9
+    connector_mask = (attention_mask.astype(encoded.dtype) - 1) * large_value
+    connector_mask = connector_mask.reshape(attention_mask.shape[0], 1, 1, attention_mask.shape[-1])
+
+    # Process through connector
+    encoded, output_mask = text_encoder.embeddings_connector(encoded, connector_mask)
+
+    # Convert mask back to binary
+    binary_mask = (output_mask.squeeze(1).squeeze(1) >= -0.5).astype(mx.int32)
+
+    # Apply mask to zero out padded positions
+    encoded = encoded * binary_mask[:, :, None]
+
+    mx.eval(encoded)
+    mx.eval(binary_mask)
+
+    print(f"  Output embedding shape: {encoded.shape}")  # Should be [B, T, 3840]
+
+    return encoded, binary_mask
+
+
 def create_dummy_text_encoding(
     prompt: str,
     batch_size: int = 1,
@@ -75,6 +210,24 @@ def create_dummy_text_encoding(
     text_mask = mx.ones((batch_size, max_tokens))
 
     return text_encoding, text_mask
+
+
+def create_null_text_encoding(
+    batch_size: int = 1,
+    max_tokens: int = 256,
+    embed_dim: int = 3840,
+) -> tuple:
+    """
+    Create null/empty text encoding for CFG unconditional pass.
+
+    Returns:
+        Tuple of (null_encoding, null_mask).
+    """
+    # Zero embeddings for unconditional generation
+    null_encoding = mx.zeros((batch_size, max_tokens, embed_dim))
+    null_mask = mx.zeros((batch_size, max_tokens))  # All masked out
+
+    return null_encoding, null_mask
 
 
 def load_text_embedding(embedding_path: str) -> tuple:
@@ -181,12 +334,19 @@ def generate_video(
     cfg_scale: float = 3.0,
     seed: int = 42,
     weights_path: str = None,
-    output_path: str = "output.mp4",
+    output_path: str = "gens/output.mp4",
     use_placeholder: bool = False,
     skip_vae: bool = False,
     embedding_path: str = None,
+    gemma_path: str = "weights/gemma-3-12b",
+    use_gemma: bool = True,
 ):
     """Generate video from text prompt."""
+
+    # Ensure output directory exists
+    output_dir = os.path.dirname(output_path)
+    if output_dir:
+        os.makedirs(output_dir, exist_ok=True)
 
     print(f"\n{'='*50}")
     print(f"LTX-2 MLX Video Generation")
@@ -198,6 +358,10 @@ def generate_video(
         print(f"VAE decoding: SKIPPED")
     if embedding_path:
         print(f"Using pre-computed embedding: {embedding_path}")
+    elif use_gemma:
+        print(f"Text encoder: Gemma 3 at {gemma_path}")
+    else:
+        print(f"Text encoder: DUMMY (testing mode)")
 
     # Set seed
     mx.random.seed(seed)
@@ -214,9 +378,35 @@ def generate_video(
     print("\n[1/5] Encoding prompt...")
     if embedding_path:
         text_encoding, text_mask = load_text_embedding(embedding_path)
+    elif use_gemma:
+        # Check if Gemma weights exist
+        if not os.path.exists(gemma_path):
+            print(f"\n  ERROR: Gemma weights not found at {gemma_path}")
+            print(f"\n  To download Gemma 3 12B:")
+            print(f"    python scripts/download_gemma.py")
+            print(f"\n  Or use --no-gemma flag to use dummy embeddings for testing")
+            return
+
+        # Use real Gemma encoding
+        text_encoding, text_mask = encode_with_gemma(
+            prompt=prompt,
+            gemma_path=gemma_path,
+            ltx_weights_path=weights_path,
+        )
+        if text_encoding is None:
+            print("  ERROR: Failed to encode prompt")
+            return
+        print(f"  Encoded with Gemma 3")
     else:
         text_encoding, text_mask = create_dummy_text_encoding(prompt)
-        print("  Using dummy encoding (Gemma integration pending)")
+        print("  Using DUMMY encoding (test mode - output will be random)")
+
+    # Create null encoding for CFG (unconditional)
+    null_encoding, null_mask = create_null_text_encoding(
+        batch_size=1,
+        max_tokens=text_encoding.shape[1],
+        embed_dim=text_encoding.shape[2],
+    )
 
     # Load model
     print("\n[2/5] Loading transformer...")
@@ -225,6 +415,11 @@ def generate_video(
     else:
         model = None
         print("  Skipping model load (placeholder mode)")
+
+    # Whether to use CFG
+    use_cfg = cfg_scale > 1.0 and model is not None
+    if use_cfg:
+        print(f"  CFG enabled with scale {cfg_scale}")
 
     # Load VAE decoder
     vae_decoder = None
@@ -261,7 +456,6 @@ def generate_video(
             # === Actual model inference ===
             # Patchify latent: [B, C, F, H, W] -> [B, T, C]
             latent_patchified = patchifier.patchify(latent)
-            num_tokens = latent_patchified.shape[1]
 
             # Create position grid with bounds
             grid = create_position_grid(1, latent_frames, latent_height, latent_width)
@@ -269,8 +463,8 @@ def generate_video(
             grid_end = grid_start + 1
             positions = mx.concatenate([grid_start, grid_end], axis=-1)
 
-            # Create modality input
-            modality = Modality(
+            # Create modality input for conditional (text-guided) pass
+            modality_cond = Modality(
                 latent=latent_patchified,
                 context=text_encoding,
                 context_mask=text_mask,
@@ -279,8 +473,8 @@ def generate_video(
                 enabled=True,
             )
 
-            # Run transformer
-            velocity_patchified = model(modality)
+            # Run transformer (conditional)
+            velocity_cond_patchified = model(modality_cond)
 
             # Unpatchify velocity: [B, T, C] -> [B, C, F, H, W]
             output_shape = VideoLatentShape(
@@ -290,7 +484,27 @@ def generate_video(
                 height=latent_height,
                 width=latent_width,
             )
-            velocity = patchifier.unpatchify(velocity_patchified, output_shape=output_shape)
+            velocity_cond = patchifier.unpatchify(velocity_cond_patchified, output_shape=output_shape)
+
+            # Apply CFG if enabled
+            if use_cfg:
+                # Unconditional (null text) pass
+                modality_uncond = Modality(
+                    latent=latent_patchified,
+                    context=null_encoding,
+                    context_mask=null_mask,
+                    timesteps=mx.array([sigma]),
+                    positions=positions,
+                    enabled=True,
+                )
+
+                velocity_uncond_patchified = model(modality_uncond)
+                velocity_uncond = patchifier.unpatchify(velocity_uncond_patchified, output_shape=output_shape)
+
+                # CFG formula: v = v_uncond + scale * (v_cond - v_uncond)
+                velocity = velocity_uncond + cfg_scale * (velocity_cond - velocity_uncond)
+            else:
+                velocity = velocity_cond
         else:
             # Placeholder: random velocity
             velocity = mx.random.normal(shape=latent.shape) * 0.1
@@ -427,7 +641,7 @@ def main():
     parser.add_argument("--steps", type=int, default=7, help="Denoising steps")
     parser.add_argument("--cfg", type=float, default=3.0, help="CFG scale")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="output.mp4", help="Output path")
+    parser.add_argument("--output", type=str, default="gens/output.mp4", help="Output path")
     parser.add_argument(
         "--weights",
         type=str,
@@ -450,6 +664,17 @@ def main():
         default=None,
         help="Path to pre-computed text embedding (.npz)"
     )
+    parser.add_argument(
+        "--gemma-path",
+        type=str,
+        default="weights/gemma-3-12b",
+        help="Path to Gemma 3 weights directory"
+    )
+    parser.add_argument(
+        "--no-gemma",
+        action="store_true",
+        help="Use dummy embeddings instead of real Gemma encoding (for testing)"
+    )
 
     args = parser.parse_args()
 
@@ -466,6 +691,8 @@ def main():
         use_placeholder=args.placeholder,
         skip_vae=args.skip_vae,
         embedding_path=args.embedding,
+        gemma_path=args.gemma_path,
+        use_gemma=not args.no_gemma,
     )
 
 

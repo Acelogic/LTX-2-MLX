@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Tuple, Union
 import mlx.core as mx
 import mlx.nn as nn
 
-from ltx_mlx.types import SpatioTemporalScaleFactors
+from LTX_2_MLX.types import SpatioTemporalScaleFactors
 
 from .convolution import make_conv_nd, PaddingModeType, NormLayerType
 from .ops import unpatchify, PerChannelStatistics

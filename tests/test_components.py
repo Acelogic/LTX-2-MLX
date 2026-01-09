@@ -6,7 +6,7 @@ import numpy as np
 
 def test_sigma_schedule():
     """Test sigma schedule generation."""
-    from ltx_mlx.components import get_sigma_schedule, LTX2Scheduler
+    from LTX_2_MLX.components import get_sigma_schedule, LTX2Scheduler
 
     # Test default schedule
     sigmas = get_sigma_schedule(num_steps=50)
@@ -23,7 +23,7 @@ def test_sigma_schedule():
 
 def test_cfg_guider():
     """Test CFG guider."""
-    from ltx_mlx.components import CFGGuider
+    from LTX_2_MLX.components import CFGGuider
 
     guider = CFGGuider(scale=7.5)
 
@@ -45,8 +45,8 @@ def test_cfg_guider():
 
 def test_gaussian_noiser():
     """Test Gaussian noiser."""
-    from ltx_mlx.components import GaussianNoiser
-    from ltx_mlx.types import LatentState
+    from LTX_2_MLX.components import GaussianNoiser
+    from LTX_2_MLX.types import LatentState
 
     noiser = GaussianNoiser()
 
@@ -74,7 +74,7 @@ def test_gaussian_noiser():
 
 def test_euler_step():
     """Test Euler diffusion step."""
-    from ltx_mlx.components import EulerDiffusionStep
+    from LTX_2_MLX.components import EulerDiffusionStep
 
     euler_step = EulerDiffusionStep()
 
@@ -93,8 +93,8 @@ def test_euler_step():
 
 def test_patchifier():
     """Test video latent patchifier."""
-    from ltx_mlx.components import VideoLatentPatchifier
-    from ltx_mlx.types import VideoLatentShape
+    from LTX_2_MLX.components import VideoLatentPatchifier
+    from LTX_2_MLX.types import VideoLatentShape
 
     patchifier = VideoLatentPatchifier(patch_size=1)
 
@@ -121,7 +121,7 @@ def test_patchifier():
 
 def test_rms_norm():
     """Test RMS normalization."""
-    from ltx_mlx import rms_norm
+    from LTX_2_MLX import rms_norm
 
     x = mx.random.normal(shape=(2, 10, 64))
     normed = rms_norm(x)
@@ -135,7 +135,7 @@ def test_rms_norm():
 
 def test_to_velocity_denoised():
     """Test velocity/denoised conversions."""
-    from ltx_mlx import to_velocity, to_denoised
+    from LTX_2_MLX import to_velocity, to_denoised
 
     x = mx.ones((1, 128, 4, 15, 22))
     noise = mx.random.normal(shape=x.shape)

@@ -5,7 +5,7 @@ import mlx.core as mx
 
 def test_rope():
     """Test Rotary Position Embedding components."""
-    from ltx_mlx.model.transformer import (
+    from LTX_2_MLX.model.transformer import (
         precompute_freqs_cis,
         apply_rotary_emb,
         create_position_grid,
@@ -43,7 +43,7 @@ def test_rope():
 
 def test_timestep_embedding():
     """Test timestep embedding components."""
-    from ltx_mlx.model.transformer import (
+    from LTX_2_MLX.model.transformer import (
         get_timestep_embedding,
         Timesteps,
         TimestepEmbedding,
@@ -71,7 +71,7 @@ def test_timestep_embedding():
 
 def test_rms_norm():
     """Test RMSNorm."""
-    from ltx_mlx.model.transformer import RMSNorm, rms_norm
+    from LTX_2_MLX.model.transformer import RMSNorm, rms_norm
 
     # Test functional rms_norm
     x = mx.random.normal(shape=(2, 10, 64))
@@ -89,7 +89,7 @@ def test_rms_norm():
 
 def test_feed_forward():
     """Test FeedForward network."""
-    from ltx_mlx.model.transformer import FeedForward
+    from LTX_2_MLX.model.transformer import FeedForward
 
     ff = FeedForward(dim=256, dim_out=256, mult=4)  # hidden = dim * mult = 1024
 
@@ -101,7 +101,7 @@ def test_feed_forward():
 
 def test_attention():
     """Test Attention modules."""
-    from ltx_mlx.model.transformer import Attention, SelfAttention, CrossAttention
+    from LTX_2_MLX.model.transformer import Attention, SelfAttention, CrossAttention
 
     # Test basic Attention (self-attention mode)
     attn = Attention(
@@ -139,7 +139,7 @@ def test_attention():
 
 def test_adaln():
     """Test Adaptive Layer Norm."""
-    from ltx_mlx.model.transformer import AdaLayerNormSingle
+    from LTX_2_MLX.model.transformer import AdaLayerNormSingle
 
     # AdaLN with timestep conditioning
     # num_embeddings=6 means: scale, shift, gate for self-attn and cross-attn (or FFN)
@@ -157,7 +157,7 @@ def test_adaln():
 
 def test_transformer_block():
     """Test BasicTransformerBlock."""
-    from ltx_mlx.model.transformer import (
+    from LTX_2_MLX.model.transformer import (
         BasicTransformerBlock,
         TransformerArgs,
         precompute_freqs_cis,
@@ -209,7 +209,7 @@ def test_transformer_block():
 
 def test_ltx_model_minimal():
     """Test LTXModel with minimal configuration."""
-    from ltx_mlx.model.transformer import LTXModel, LTXModelType, Modality, create_position_grid
+    from LTX_2_MLX.model.transformer import LTXModel, LTXModelType, Modality, create_position_grid
 
     # Create a minimal model (fewer layers for testing)
     # inner_dim = num_heads * head_dim must equal cross_attention_dim

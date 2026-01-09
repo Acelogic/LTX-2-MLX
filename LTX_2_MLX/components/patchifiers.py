@@ -5,7 +5,7 @@ from typing import Optional, Protocol, Tuple
 
 import mlx.core as mx
 
-from ltx_mlx.types import (
+from LTX_2_MLX.types import (
     AudioLatentShape,
     SpatioTemporalScaleFactors,
     VideoLatentShape,

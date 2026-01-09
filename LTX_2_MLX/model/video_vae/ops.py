@@ -82,33 +82,33 @@ def unpatchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.arr
         return x
 
     if x.ndim == 4:
-        # 4D: (B, C*r*q, H, W) -> (B, C, H*q, W*r)
+        # 4D: (B, C*r*r, H, W) -> (B, C, H*r, W*r)
+        # Match PyTorch pixel_shuffle: channels packed as (C, r_h, r_w)
         b, c_packed, h, w = x.shape
-        q = patch_size_hw
         r = patch_size_hw
-        c = c_packed // (r * q)
+        c = c_packed // (r * r)
 
-        # Reshape: (B, C*r*q, H, W) -> (B, C, r, q, H, W)
-        x = x.reshape(b, c, r, q, h, w)
-        # Transpose: (B, C, r, q, H, W) -> (B, C, H, q, W, r)
-        x = x.transpose(0, 1, 4, 3, 5, 2)
-        # Reshape: (B, C, H, q, W, r) -> (B, C, H*q, W*r)
-        x = x.reshape(b, c, h * q, w * r)
+        # Reshape: (B, C*r*r, H, W) -> (B, C, r_h, r_w, H, W)
+        x = x.reshape(b, c, r, r, h, w)
+        # Transpose: (B, C, r_h, r_w, H, W) -> (B, C, H, r_h, W, r_w)
+        x = x.transpose(0, 1, 4, 2, 5, 3)
+        # Reshape: (B, C, H, r_h, W, r_w) -> (B, C, H*r, W*r)
+        x = x.reshape(b, c, h * r, w * r)
 
     elif x.ndim == 5:
-        # 5D: (B, C*p*r*q, F, H, W) -> (B, C, F*p, H*q, W*r)
+        # 5D: (B, C*p*r*r, F, H, W) -> (B, C, F*p, H*r, W*r)
+        # Match PyTorch pixel_shuffle: channels packed as (C, p, r_h, r_w)
         b, c_packed, f, h, w = x.shape
         p = patch_size_t
-        q = patch_size_hw
         r = patch_size_hw
-        c = c_packed // (p * r * q)
+        c = c_packed // (p * r * r)
 
-        # Reshape: (B, C*p*r*q, F, H, W) -> (B, C, p, r, q, F, H, W)
-        x = x.reshape(b, c, p, r, q, f, h, w)
-        # Transpose: -> (B, C, F, p, H, q, W, r)
-        x = x.transpose(0, 1, 5, 2, 6, 4, 7, 3)
-        # Reshape: -> (B, C, F*p, H*q, W*r)
-        x = x.reshape(b, c, f * p, h * q, w * r)
+        # Reshape: (B, C*p*r*r, F, H, W) -> (B, C, p, r_h, r_w, F, H, W)
+        x = x.reshape(b, c, p, r, r, f, h, w)
+        # Transpose: -> (B, C, F, p, H, r_h, W, r_w)
+        x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+        # Reshape: -> (B, C, F*p, H*r, W*r)
+        x = x.reshape(b, c, f * p, h * r, w * r)
 
     else:
         raise ValueError(f"Invalid input shape: {x.shape}, expected 4D or 5D")

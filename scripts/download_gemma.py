@@ -63,6 +63,22 @@ def download_gemma(token: str = None, output_dir: str = "weights/gemma-3-12b"):
             ],
         )
         print(f"\nDownload complete: {local_dir}")
+
+        # Verify required files exist
+        required_files = ["config.json", "tokenizer_config.json"]
+        missing = [f for f in required_files if not (output_path / f).exists()]
+        if missing:
+            print(f"\nWarning: Missing files: {missing}")
+            return False
+
+        # Check for model weights
+        safetensor_files = list(output_path.glob("*.safetensors"))
+        if not safetensor_files:
+            print("\nWarning: No safetensor files found!")
+            return False
+
+        print(f"\nFound {len(safetensor_files)} weight files")
+        print("Ready for use with LTX-2-MLX!")
         return True
 
     except Exception as e:
@@ -89,8 +105,8 @@ def main():
     parser.add_argument(
         "--output",
         type=str,
-        default="weights/gemma-3-12b",
-        help="Output directory",
+        default="weights/gemma/gemma-3-12b-it",
+        help="Output directory (default matches encode_prompt.py expectations)",
     )
 
     args = parser.parse_args()

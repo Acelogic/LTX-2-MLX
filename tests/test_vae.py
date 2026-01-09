@@ -6,7 +6,7 @@ import numpy as np
 
 def test_vae_ops():
     """Test VAE basic operations."""
-    from ltx_mlx.model.video_vae import patchify, unpatchify
+    from LTX_2_MLX.model.video_vae import patchify, unpatchify
 
     # Test patchify/unpatchify roundtrip
     # Input: (B, C, F, H, W) with H, W divisible by patch_size
@@ -31,7 +31,7 @@ def test_vae_ops():
 
 def test_pixel_shuffle():
     """Test pixel shuffle operations."""
-    from ltx_mlx.model.video_vae import pixel_shuffle_3d, pixel_unshuffle_3d
+    from LTX_2_MLX.model.video_vae import pixel_shuffle_3d, pixel_unshuffle_3d
 
     # Test pixel_shuffle_3d: (B, C*r², F, H, W) -> (B, C, F, H*r, W*r)
     # Note: Only spatial shuffle, temporal dimension unchanged
@@ -49,7 +49,7 @@ def test_pixel_shuffle():
 
 def test_per_channel_statistics():
     """Test per-channel statistics normalization."""
-    from ltx_mlx.model.video_vae import PerChannelStatistics
+    from LTX_2_MLX.model.video_vae import PerChannelStatistics
 
     stats = PerChannelStatistics(latent_channels=128)
 
@@ -71,7 +71,7 @@ def test_per_channel_statistics():
 
 def test_resnet_block():
     """Test ResNet 3D block."""
-    from ltx_mlx.model.video_vae import ResnetBlock3D, NormLayerType
+    from LTX_2_MLX.model.video_vae import ResnetBlock3D, NormLayerType
 
     block = ResnetBlock3D(
         dims=3,
@@ -91,7 +91,7 @@ def test_resnet_block():
 
 def test_dual_conv3d():
     """Test DualConv3d (2D+1D decomposition of 3D conv)."""
-    from ltx_mlx.model.video_vae import DualConv3d
+    from LTX_2_MLX.model.video_vae import DualConv3d
 
     conv = DualConv3d(
         in_channels=64,
@@ -110,7 +110,7 @@ def test_dual_conv3d():
 
 def test_causal_conv3d():
     """Test CausalConv3d."""
-    from ltx_mlx.model.video_vae import CausalConv3d
+    from LTX_2_MLX.model.video_vae import CausalConv3d
 
     conv = CausalConv3d(
         in_channels=64,
@@ -126,7 +126,7 @@ def test_causal_conv3d():
 
 def test_sampling_blocks():
     """Test upsampling and downsampling blocks."""
-    from ltx_mlx.model.video_vae import SpaceToDepthDownsample, DepthToSpaceUpsample
+    from LTX_2_MLX.model.video_vae import SpaceToDepthDownsample, DepthToSpaceUpsample
 
     # Test downsampling: spatial 2x, temporal 1x
     down = SpaceToDepthDownsample(
@@ -154,7 +154,7 @@ def test_sampling_blocks():
 
 def test_video_decoder_minimal():
     """Test VideoDecoder with minimal configuration."""
-    from ltx_mlx.model.video_vae import VideoDecoder
+    from LTX_2_MLX.model.video_vae import VideoDecoder
 
     # Minimal decoder - just conv_in and conv_out, no upsampling blocks
     decoder = VideoDecoder(
@@ -180,7 +180,7 @@ def test_video_decoder_minimal():
 
 def test_video_encoder_minimal():
     """Test VideoEncoder with minimal configuration."""
-    from ltx_mlx.model.video_vae import VideoEncoder
+    from LTX_2_MLX.model.video_vae import VideoEncoder
 
     # Minimal encoder - just patchify, conv_in, and conv_out
     encoder = VideoEncoder(

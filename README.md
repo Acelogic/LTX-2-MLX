@@ -12,7 +12,7 @@ Native Apple Silicon implementation of [Lightricks LTX-2](https://github.com/Lig
 ## Project Structure
 
 ```
-ltx_mlx/
+LTX_2_MLX/
 ├── model/
 │   ├── transformer/     # 48-layer DiT with RoPE
 │   ├── video_vae/       # VAE encoder/decoder with 3D convolutions

@@ -378,7 +378,7 @@ def _flatten_to_nested(flat_dict: Dict[str, mx.array]) -> Dict[str, Any]:
         flat_dict: Dictionary with keys like "transformer_blocks.0.attn1.to_q.weight"
 
     Returns:
-        Nested dictionary structure.
+        Nested dictionary structure with lists where indices are numeric.
     """
     nested = {}
 
@@ -393,7 +393,35 @@ def _flatten_to_nested(flat_dict: Dict[str, mx.array]) -> Dict[str, Any]:
 
         current[parts[-1]] = value
 
-    return nested
+    # Convert dicts with numeric string keys to lists
+    return _convert_numeric_dicts_to_lists(nested)
+
+
+def _convert_numeric_dicts_to_lists(obj: Any) -> Any:
+    """
+    Recursively convert dicts with numeric string keys to lists.
+
+    For example: {"0": {...}, "1": {...}} -> [{...}, {...}]
+
+    This is needed because MLX model.update() expects lists for
+    list-type attributes like transformer_blocks.
+    """
+    if isinstance(obj, dict):
+        # First, recursively process all values
+        processed = {k: _convert_numeric_dicts_to_lists(v) for k, v in obj.items()}
+
+        # Check if all keys are numeric strings
+        if processed and all(k.isdigit() for k in processed.keys()):
+            # Convert to list, handling potential gaps
+            max_idx = max(int(k) for k in processed.keys())
+            result = [None] * (max_idx + 1)
+            for k, v in processed.items():
+                result[int(k)] = v
+            return result
+
+        return processed
+
+    return obj
 
 
 def save_mlx_weights(weights: Dict[str, mx.array], path: str) -> None:

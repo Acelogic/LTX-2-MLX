@@ -320,8 +320,13 @@ class Gemma3Model(nn.Module):
                 mx.full((seq_len, seq_len), float("-inf")),
                 k=1,
             )
-            # Add padding mask
-            padding_mask = (1 - attention_mask[:, None, None, :]) * float("-inf")
+            # Add padding mask: 1 -> 0, 0 -> -inf
+            # Use mx.where to avoid 0 * -inf = NaN
+            padding_mask = mx.where(
+                attention_mask[:, None, None, :] == 1,
+                mx.zeros((1,)),
+                mx.full((1,), float("-inf")),
+            )
             attention_mask = causal_mask[None, None, :, :] + padding_mask
 
         # Process through layers
@@ -343,13 +348,18 @@ class Gemma3Model(nn.Module):
         return hidden_states, all_hidden_states
 
 
-def load_gemma3_weights(model: Gemma3Model, weights_dir: str) -> None:
+def load_gemma3_weights(
+    model: Gemma3Model,
+    weights_dir: str,
+    use_fp16: bool = True,
+) -> None:
     """
     Load Gemma 3 weights from safetensors files.
 
     Args:
         model: Gemma3Model instance.
         weights_dir: Directory containing model-0000X-of-00005.safetensors files.
+        use_fp16: Whether to use float16 for weights (saves ~50% memory).
     """
     from safetensors import safe_open
     import torch
@@ -368,17 +378,19 @@ def load_gemma3_weights(model: Gemma3Model, weights_dir: str) -> None:
         print(f"Loading Gemma 3 weights from {len(shard_files)} shards...")
 
     loaded_count = 0
+    target_dtype = mx.float16 if use_fp16 else mx.float32
 
     for shard_file in shard_iter:
         with safe_open(str(shard_file), framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
 
-                # Convert bfloat16 to float32
+                # Convert to float32 first (bfloat16 not directly supported)
                 if tensor.dtype == torch.bfloat16:
                     tensor = tensor.to(torch.float32)
 
-                value = mx.array(tensor.numpy())
+                # Convert to MLX array with target dtype
+                value = mx.array(tensor.numpy()).astype(target_dtype)
 
                 # Parse key and set weight
                 if key == "language_model.model.embed_tokens.weight":
