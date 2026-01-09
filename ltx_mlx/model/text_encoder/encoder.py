@@ -298,8 +298,8 @@ def load_text_encoder_weights(
             tensor = f.get_tensor(fe_key)
             if tensor.dtype == torch.bfloat16:
                 tensor = tensor.to(torch.float32)
-            # PyTorch: [out, in] -> MLX: [in, out] for Linear
-            encoder.feature_extractor.aggregate_embed.weight = mx.array(tensor.numpy().T)
+            # MLX Linear stores weight as (out, in), same as PyTorch - no transpose needed
+            encoder.feature_extractor.aggregate_embed.weight = mx.array(tensor.numpy())
             loaded_count += 1
 
         # Load embeddings connector
@@ -341,9 +341,7 @@ def load_text_encoder_weights(
                         tensor = tensor.to(torch.float32)
                     value = mx.array(tensor.numpy())
 
-                    # Transpose Linear weights
-                    if param_name == "weight" and value.ndim == 2:
-                        value = value.T
+                    # MLX Linear stores (out, in) same as PyTorch - no transpose needed
 
                     attn = getattr(block, attn_name)
                     layer = getattr(attn, layer_name)
@@ -366,9 +364,7 @@ def load_text_encoder_weights(
                         tensor = tensor.to(torch.float32)
                     value = mx.array(tensor.numpy())
 
-                    # Transpose Linear weights
-                    if param_name == "weight" and value.ndim == 2:
-                        value = value.T
+                    # MLX Linear stores (out, in) same as PyTorch - no transpose needed
 
                     layer1 = getattr(block.ff, layer1_name)
                     if layer2_name:
@@ -390,9 +386,7 @@ def load_text_encoder_weights(
                         tensor = tensor.to(torch.float32)
                     value = mx.array(tensor.numpy())
 
-                    # Transpose Linear weights
-                    if param_name == "weight" and value.ndim == 2:
-                        value = value.T
+                    # MLX Linear stores (out, in) same as PyTorch - no transpose needed
 
                     layer = getattr(encoder.caption_projection, layer_name)
                     setattr(layer, param_name, value)
