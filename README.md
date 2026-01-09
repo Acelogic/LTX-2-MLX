@@ -100,10 +100,53 @@ LTX-2 requires frames to satisfy `frames % 8 == 1`:
 
 ### Text Encoder
 
-- Gemma 2B feature extraction (49 layers × 3840 dim)
+- **Gemma 3 12B** feature extraction (48 layers × 3840 dim)
 - Aggregation projection (188160 → 3840)
 - 2-layer 1D transformer connector
 - Caption projection (3840 → 4096)
+
+## Text Encoding Options
+
+### Option 1: Pre-computed Embeddings (Recommended)
+
+Use the PyTorch script to generate embeddings with the official LTX-2 encoder:
+
+```bash
+# Requires: pip install torch transformers safetensors
+# Requires: Gemma 3 12B safetensors in weights/gemma-3-12b/
+
+python scripts/encode_with_pytorch.py "Your prompt here" \
+    --gemma-path weights/gemma-3-12b \
+    --output prompt_embedding.npz
+
+python scripts/generate.py --embedding prompt_embedding.npz
+```
+
+### Option 2: Dummy Embeddings (Testing)
+
+For testing without Gemma, the pipeline uses deterministic random embeddings:
+
+```bash
+python scripts/generate.py "A cat walking" --height 128 --width 128
+```
+
+### Downloading Gemma 3 12B
+
+LTX-2 requires **Gemma 3 12B** in safetensors format (~25GB):
+
+```bash
+# Using the download script (requires HuggingFace token):
+pip install huggingface_hub
+python scripts/download_gemma.py --token YOUR_HF_TOKEN
+
+# Or set environment variable:
+export HF_TOKEN=your_token
+python scripts/download_gemma.py
+```
+
+Get your token at: https://huggingface.co/settings/tokens
+
+Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 
 ## Current Status
 
