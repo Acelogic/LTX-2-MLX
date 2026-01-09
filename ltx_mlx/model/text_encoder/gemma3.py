@@ -325,8 +325,15 @@ class Gemma3Model(nn.Module):
             attention_mask = causal_mask[None, None, :, :] + padding_mask
 
         # Process through layers
-        for layer in self.layers:
+        try:
+            from tqdm import tqdm
+            layer_iter = tqdm(self.layers, desc="Gemma forward", ncols=80, leave=False)
+        except ImportError:
+            layer_iter = self.layers
+
+        for layer in layer_iter:
             hidden_states = layer(hidden_states, attention_mask, position_ids)
+            mx.eval(hidden_states)  # Force eval for progress tracking
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
 
@@ -353,10 +360,16 @@ def load_gemma3_weights(model: Gemma3Model, weights_dir: str) -> None:
     if not shard_files:
         raise FileNotFoundError(f"No safetensors files found in {weights_dir}")
 
-    print(f"Loading Gemma 3 weights from {len(shard_files)} shards...")
+    try:
+        from tqdm import tqdm
+        shard_iter = tqdm(shard_files, desc="Loading Gemma shards", ncols=80)
+    except ImportError:
+        shard_iter = shard_files
+        print(f"Loading Gemma 3 weights from {len(shard_files)} shards...")
+
     loaded_count = 0
 
-    for shard_file in shard_files:
+    for shard_file in shard_iter:
         with safe_open(str(shard_file), framework="pt") as f:
             for key in f.keys():
                 tensor = f.get_tensor(key)
