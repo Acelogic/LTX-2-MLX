@@ -4,6 +4,8 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+# Compiled patchify for better performance - fuses reshape/transpose chains
+@mx.compile
 def patchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.array:
     """
     Space-to-depth: rearrange spatial dimensions into channels.
@@ -60,6 +62,8 @@ def patchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.array
     return x
 
 
+# Compiled unpatchify for better performance - fuses reshape/transpose chains
+@mx.compile
 def unpatchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.array:
     """
     Depth-to-space: rearrange channels back into spatial dimensions.
@@ -197,6 +201,8 @@ class PerChannelStatistics(nn.Module):
                 setattr(self, mlx_attr, mx.array(state_dict[full_key]))
 
 
+# Compiled pixel shuffle for better performance
+@mx.compile
 def pixel_shuffle_3d(x: mx.array, upscale_factor: int) -> mx.array:
     """
     Pixel shuffle for 3D tensors (depth-to-space).
@@ -225,6 +231,8 @@ def pixel_shuffle_3d(x: mx.array, upscale_factor: int) -> mx.array:
     return x
 
 
+# Compiled pixel unshuffle for better performance
+@mx.compile
 def pixel_unshuffle_3d(x: mx.array, downscale_factor: int) -> mx.array:
     """
     Pixel unshuffle for 3D tensors (space-to-depth).

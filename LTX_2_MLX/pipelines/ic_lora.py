@@ -11,9 +11,15 @@ from dataclasses import dataclass
 from typing import Callable, Dict, List, Optional
 
 import mlx.core as mx
-import numpy as np
-from PIL import Image
 
+from .common import (
+    ImageCondition,
+    apply_conditionings,
+    create_image_conditionings,
+    modality_from_state,
+    post_process_latent,
+    timesteps_from_mask,
+)
 from ..components import (
     DISTILLED_SIGMA_VALUES,
     STAGE_2_DISTILLED_SIGMA_VALUES,
@@ -23,7 +29,6 @@ from ..components import (
 )
 from ..conditioning.item import ConditioningItem
 from ..conditioning.keyframe import VideoConditionByKeyframeIndex
-from ..conditioning.latent import VideoConditionByLatentIndex
 from ..conditioning.tools import VideoLatentTools
 from ..loader import LoRAConfig, fuse_lora_into_weights
 from ..model.transformer import LTXModel, Modality, X0Model
@@ -74,36 +79,11 @@ class ICLoraConfig:
 
 
 @dataclass
-class ImageCondition:
-    """An image condition for replacing latent at a specific frame."""
-
-    image_path: str
-    frame_index: int
-    strength: float = 0.95
-
-
-@dataclass
 class VideoCondition:
     """A video control signal (depth, pose, canny, etc.) for IC-LoRA."""
 
     video_path: str
     strength: float = 0.95
-
-
-def load_image_tensor(
-    image_path: str,
-    height: int,
-    width: int,
-    dtype: mx.Dtype = mx.float32,
-) -> mx.array:
-    """Load an image and prepare for VAE encoding."""
-    img = Image.open(image_path).convert("RGB")
-    img = img.resize((width, height), Image.Resampling.LANCZOS)
-    img_np = np.array(img).astype(np.float32) / 127.5 - 1.0
-    img_mx = mx.array(img_np)
-    img_mx = mx.transpose(img_mx, (2, 0, 1))  # (C, H, W)
-    img_mx = img_mx[None, :, None, :, :]  # (1, C, 1, H, W)
-    return img_mx.astype(dtype)
 
 
 def load_video_tensor(
@@ -161,31 +141,6 @@ def load_video_tensor(
     return video_mx.astype(dtype)
 
 
-def create_image_conditionings(
-    images: List[ImageCondition],
-    video_encoder: SimpleVideoEncoder,
-    height: int,
-    width: int,
-    dtype: mx.Dtype = mx.float32,
-) -> List[ConditioningItem]:
-    """Create conditionings that replace latent at specific frame indices."""
-    conditionings = []
-
-    for img_cond in images:
-        image_tensor = load_image_tensor(img_cond.image_path, height, width, dtype)
-        encoded_latent = video_encoder(image_tensor)
-        mx.eval(encoded_latent)
-
-        conditioning = VideoConditionByLatentIndex(
-            latent=encoded_latent,
-            strength=img_cond.strength,
-            latent_idx=img_cond.frame_index,
-        )
-        conditionings.append(conditioning)
-
-    return conditionings
-
-
 def create_video_conditionings(
     videos: List[VideoCondition],
     video_encoder: SimpleVideoEncoder,
@@ -213,51 +168,6 @@ def create_video_conditionings(
         conditionings.append(conditioning)
 
     return conditionings
-
-
-def apply_conditionings(
-    latent_state: LatentState,
-    conditionings: List[ConditioningItem],
-    video_tools: VideoLatentTools,
-) -> LatentState:
-    """Apply all conditionings to the latent state."""
-    for conditioning in conditionings:
-        latent_state = conditioning.apply_to(latent_state, video_tools)
-    return latent_state
-
-
-def post_process_latent(
-    denoised: mx.array,
-    denoise_mask: mx.array,
-    clean_latent: mx.array,
-) -> mx.array:
-    """Blend denoised output with clean state based on mask."""
-    return (denoised * denoise_mask + clean_latent * (1 - denoise_mask)).astype(
-        denoised.dtype
-    )
-
-
-def timesteps_from_mask(denoise_mask: mx.array, sigma: float) -> mx.array:
-    """Compute timesteps from denoise mask and sigma."""
-    return denoise_mask * sigma
-
-
-def modality_from_state(
-    state: LatentState,
-    context: mx.array,
-    context_mask: mx.array,
-    sigma: float,
-    enabled: bool = True,
-) -> Modality:
-    """Create a Modality from a latent state."""
-    return Modality(
-        enabled=enabled,
-        latent=state.latent,
-        timesteps=timesteps_from_mask(state.denoise_mask, sigma),
-        positions=state.positions,
-        context=context,
-        context_mask=context_mask,
-    )
 
 
 class ICLoraPipeline:

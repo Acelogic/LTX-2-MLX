@@ -1,0 +1,135 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "ltx-2-mlx"
+version = "0.1.0"
+description = "LTX-2 19B video generation model ported to Apple MLX"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "Apache-2.0"}
+authors = [
+    {name = "LTX-2-MLX Contributors"}
+]
+keywords = ["video generation", "diffusion", "mlx", "apple silicon", "ltx-2"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Multimedia :: Video",
+]
+
+dependencies = [
+    "mlx>=0.20.0",
+    "numpy>=1.24.0",
+    "pillow>=10.0.0",
+    "safetensors>=0.4.0",
+    "tqdm>=4.65.0",
+    "einops>=0.7.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.4.0",
+    "pytest-timeout>=2.1.0",
+    "black>=23.0.0",
+    "ruff>=0.1.0",
+    "pyright>=1.1.0",
+]
+test = [
+    "pytest>=7.4.0",
+    "pytest-timeout>=2.1.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/username/LTX-2-MLX"
+Repository = "https://github.com/username/LTX-2-MLX"
+Documentation = "https://github.com/username/LTX-2-MLX/blob/main/README.md"
+Issues = "https://github.com/username/LTX-2-MLX/issues"
+
+[project.scripts]
+ltx2-generate = "LTX_2_MLX.scripts.generate:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["LTX_2_MLX"]
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --strict-markers"
+testpaths = ["tests"]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"
+markers = [
+    "slow: marks tests as slow (deselect with '-m \"not slow\"')",
+    "requires_weights: marks tests that require model weights",
+    "integration: marks tests as integration tests",
+    "unit: marks tests as unit tests",
+]
+# Set PYTHONPATH for tests
+pythonpath = "."
+
+[tool.black]
+line-length = 100
+target-version = ['py310', 'py311', 'py312']
+include = '\.pyi?$'
+extend-exclude = '''
+/(
+  # directories
+  \.eggs
+  | \.git
+  | \.hg
+  | \.mypy_cache
+  | \.tox
+  | \.venv
+  | build
+  | dist
+  | LTX-2
+)/
+'''
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+extend-exclude = ["LTX-2"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "B",   # flake8-bugbear
+    "C4",  # flake8-comprehensions
+    "UP",  # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by black)
+    "B008",  # do not perform function calls in argument defaults
+    "C901",  # too complex
+    "W191",  # indentation contains tabs
+]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]  # unused imports in __init__ files
+
+[tool.pyright]
+include = ["LTX_2_MLX", "tests"]
+exclude = [
+    "**/__pycache__",
+    "**/.pytest_cache",
+    "LTX-2",
+    "gens",
+    "weights",
+]
+reportMissingImports = true
+reportMissingTypeStubs = false
+pythonVersion = "3.10"
+pythonPlatform = "Darwin"

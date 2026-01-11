@@ -819,14 +819,12 @@ def generate_video(
 
         # Load spatial upscaler
         print("\n[3.5/5] Loading spatial upscaler...")
-        # BUGFIX: Force spatial upscaler to use FP32 to avoid numerical issues
-        spatial_upscaler = SpatialUpscaler(compute_dtype=mx.float32)
+        spatial_upscaler = SpatialUpscaler()
         load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
 
         # DEBUG: Check if weights are loaded
-        print(f"DEBUG: initial_conv.weight stats - mean: {float(mx.mean(spatial_upscaler.initial_conv.weight)):.6f}, std: {float(mx.std(spatial_upscaler.initial_conv.weight.astype(mx.float32))):.6f}")
-        print(f"DEBUG: final_conv.weight stats - mean: {float(mx.mean(spatial_upscaler.final_conv.weight)):.6f}, std: {float(mx.std(spatial_upscaler.final_conv.weight.astype(mx.float32))):.6f}")
-        print(f"DEBUG: Using spatial upscaler with compute_dtype=FP32 to avoid numerical issues")
+        print(f"DEBUG: initial_conv_weight stats - mean: {float(mx.mean(spatial_upscaler.initial_conv_weight)):.6f}, std: {float(mx.std(spatial_upscaler.initial_conv_weight.astype(mx.float32))):.6f}")
+        print(f"DEBUG: final_conv_weight stats - mean: {float(mx.mean(spatial_upscaler.final_conv_weight)):.6f}, std: {float(mx.std(spatial_upscaler.final_conv_weight.astype(mx.float32))):.6f}")
 
         # Load video encoder
         print("[3.5/5] Loading VAE encoder...")
@@ -1233,7 +1231,7 @@ def generate_video(
         print(f"  Input latent: {latent.shape}")
 
         # Load upscaler
-        spatial_upscaler = SpatialUpscaler(compute_dtype=compute_dtype)
+        spatial_upscaler = SpatialUpscaler()
         load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
 
         # Upscale latent
@@ -1252,7 +1250,7 @@ def generate_video(
         print(f"  Input latent: {latent.shape}")
 
         # Load upscaler
-        temporal_upscaler = TemporalUpscaler(compute_dtype=compute_dtype)
+        temporal_upscaler = TemporalUpscaler()
         load_temporal_upscaler_weights(temporal_upscaler, temporal_upscaler_weights)
 
         # Upscale latent

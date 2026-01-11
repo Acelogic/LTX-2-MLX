@@ -735,7 +735,6 @@ def decode_latent(
     latent: mx.array,
     decoder: SimpleVideoDecoder,
     timestep: Optional[float] = 0.05,
-    contrast_boost: Optional[float] = None,
 ) -> mx.array:
     """
     Decode latent to video frames.
@@ -745,10 +744,6 @@ def decode_latent(
         decoder: Loaded SimpleVideoDecoder instance.
         timestep: Timestep for conditioning (default 0.05 for denoising).
                   Use 0.0 for no denoising, None to disable timestep conditioning.
-        contrast_boost: Optional contrast multiplier (e.g., 1.2 for 20% more contrast).
-                        Larger videos (>480p) may benefit from 1.2-1.5 boost due to
-                        the denoising process producing less channel diversity at scale.
-                        Use "auto" to automatically compute based on resolution.
 
     Returns:
         Video frames as uint8 (T, H, W, 3) in [0, 255].
@@ -757,42 +752,17 @@ def decode_latent(
     if latent.ndim == 4:
         latent = latent[None]
 
-    # Auto-compute contrast boost based on resolution if not specified
-    # Larger videos tend to have lower dynamic range due to attention spreading
-    # across more tokens during denoising, resulting in more uniform channels
-    _, _, _, h, w = latent.shape
-    latent_pixels = h * w
-    if contrast_boost is None and latent_pixels > 150:  # Roughly > 384p
-        # Scale contrast boost based on resolution:
-        # - 150 pixels (e.g., 10x15): boost 1.0 (no change)
-        # - 330 pixels (e.g., 15x22 = 480x704): boost ~1.25
-        # - 600 pixels (e.g., 24x25): boost ~1.45
-        # Formula calibrated to match small video variance (~107)
-        contrast_boost = min(1.5, 1.0 + (latent_pixels - 150) / 700)
-
-    # Light normalization: just ensure overall std is reasonable
-    # The linear schedule produces latent with channel means in [-1.2, 1.4] which is close to expected
-    # Only do mild normalization if std is too far from 1.0
-    latent_std = float(mx.sqrt(mx.mean(latent * latent)))
-    if latent_std > 1.5 or latent_std < 0.5:
-        latent = latent / latent_std
+    # NOTE: Skipping per-channel denormalization for now
+    # The diffusion model outputs may already be in the correct space
+    # PyTorch does: x * std_of_means + mean_of_means
+    # But this makes our output too dark (std~0.15 shrinks values)
+    # TODO: Investigate if we need inverse operation or no operation
 
     # Decode with timestep conditioning
     video = decoder(latent, timestep=timestep)
 
-    # Apply bias correction to center output at 0
-    # The decoder outputs with a consistent negative bias (~-0.16 to -0.30)
-    # This correction brings brightness closer to ~50%
-    video = video + 0.30
-
-    # Apply contrast boost if specified
-    # This helps larger videos that have reduced channel diversity
-    if contrast_boost is not None and contrast_boost != 1.0:
-        # Boost contrast around the mean
-        video_mean = mx.mean(video)
-        video = video_mean + (video - video_mean) * contrast_boost
-
-    # Convert to uint8: assume output is in [-1, 1]
+    # Convert to uint8: output is in [-1, 1] (matching PyTorch)
+    # Note: Removed hardcoded +0.30 bias - decoder should output correctly centered values
     video = mx.clip((video + 1) / 2, 0, 1) * 255
     video = video.astype(mx.uint8)
 

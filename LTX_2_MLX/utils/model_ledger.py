@@ -230,7 +230,7 @@ class ModelLedger:
         from ..model.upscaler import SpatialUpscaler, load_spatial_upscaler_weights
 
         print(f"Loading spatial upscaler from {self.spatial_upscaler_path}...")
-        upscaler = SpatialUpscaler(compute_dtype=self.compute_dtype)
+        upscaler = SpatialUpscaler()
         load_spatial_upscaler_weights(upscaler, self.spatial_upscaler_path)
 
         self._spatial_upscaler = upscaler

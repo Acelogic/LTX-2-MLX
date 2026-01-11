@@ -50,10 +50,11 @@ class VideoLatentTools:
             Patchified LatentState ready for diffusion.
         """
         if initial_latent is not None:
-            assert initial_latent.shape == self.target_shape.to_tuple(), (
-                f"Latent shape {initial_latent.shape} does not match "
-                f"target shape {self.target_shape.to_tuple()}"
-            )
+            if initial_latent.shape != self.target_shape.to_tuple():
+                raise ValueError(
+                    f"Initial latent shape {initial_latent.shape} does not match "
+                    f"target shape {self.target_shape.to_tuple()}"
+                )
         else:
             initial_latent = mx.zeros(self.target_shape.to_tuple(), dtype=dtype)
 
