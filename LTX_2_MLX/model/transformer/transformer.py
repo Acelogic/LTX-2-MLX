@@ -256,6 +256,7 @@ class BasicAVTransformerBlock(nn.Module):
         audio_config: Optional[TransformerConfig] = None,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
+        cross_attn_scale: float = 1.0,
     ):
         """
         Initialize AudioVideo transformer block.
@@ -266,11 +267,13 @@ class BasicAVTransformerBlock(nn.Module):
             audio_config: Configuration for audio stream (dim=2048, heads=32, head_dim=64).
             rope_type: Type of RoPE to use.
             norm_eps: Epsilon for normalization.
+            cross_attn_scale: Scaling factor for cross-attention output (default 1.0).
         """
         super().__init__()
 
         self.idx = idx
         self.norm_eps = norm_eps
+        self.cross_attn_scale = cross_attn_scale
 
         # Video components
         if video_config is not None:
@@ -432,13 +435,22 @@ class BasicAVTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, 0, 3
             )
-            norm_vx = rms_norm(vx, eps=self.norm_eps) * (1 + scale_msa) + shift_msa
-            vx = vx + self.attn1(norm_vx, pe=video.positional_embeddings) * gate_msa
-            vx = vx + self.attn2(
+            
+            # Video self-attention with compiled AdaLN and residual gate
+            norm_vx = _compiled_adaln_forward(vx, scale_msa, shift_msa, self.norm_eps)
+            attn_out = self.attn1(norm_vx, pe=video.positional_embeddings)
+            vx = _compiled_residual_gate(vx, attn_out, gate_msa)
+
+            # Video cross-attention to text
+            # No AdaLN here, just RMSNorm. But we apply cross_attn_scale.
+            cross_out = self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 mask=video.context_mask,
             )
+            # Apply scaling if defined
+            scale = getattr(self, "cross_attn_scale", 1.0)
+            vx = vx + cross_out * scale
 
         # Audio self-attention + cross-attention to text
         if run_ax:
@@ -525,8 +537,10 @@ class BasicAVTransformerBlock(nn.Module):
             shift_mlp, scale_mlp, gate_mlp = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, 3, 6
             )
-            vx_scaled = rms_norm(vx, eps=self.norm_eps) * (1 + scale_mlp) + shift_mlp
-            vx = vx + self.ff(vx_scaled) * gate_mlp
+            # Use compiled helpers
+            vx_scaled = _compiled_adaln_forward(vx, scale_mlp, shift_mlp, self.norm_eps)
+            ff_out = self.ff(vx_scaled)
+            vx = _compiled_residual_gate(vx, ff_out, gate_mlp)
 
         # Audio feed-forward
         if run_ax:

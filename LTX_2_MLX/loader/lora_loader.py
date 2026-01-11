@@ -70,17 +70,28 @@ def find_lora_keys_for_weight(
     # Remove .weight suffix if present
     prefix = base_key.replace(".weight", "")
 
-    # Try different LoRA naming conventions
-    patterns = [
-        (f"{prefix}.lora_A.weight", f"{prefix}.lora_B.weight"),
-        (f"{prefix}.lora_down.weight", f"{prefix}.lora_up.weight"),
-        (f"{prefix}.lora_A", f"{prefix}.lora_B"),
-        (f"{prefix}.lora_down", f"{prefix}.lora_up"),
+    # Candidate prefixes to try
+    candidate_prefixes = [prefix]
+    if not prefix.startswith("diffusion_model."):
+        candidate_prefixes.append(f"diffusion_model.{prefix}")
+    if prefix.startswith("model."):
+        candidate_prefixes.append(prefix.replace("model.", "diffusion_model."))
+    
+    # Redefine patterns as suffixes to apply to prefix
+    suffixes = [
+        (".lora_A.weight", ".lora_B.weight"),
+        (".lora_down.weight", ".lora_up.weight"),
+        (".lora_A", ".lora_B"),
+        (".lora_down", ".lora_up"),
     ]
 
-    for key_a, key_b in patterns:
-        if key_a in lora_weights and key_b in lora_weights:
-            return key_a, key_b
+    for cand_prefix in candidate_prefixes:
+        for suff_a, suff_b in suffixes:
+            key_a = f"{cand_prefix}{suff_a}"
+            key_b = f"{cand_prefix}{suff_b}"
+            
+            if key_a in lora_weights and key_b in lora_weights:
+                return key_a, key_b
 
     return None, None
 

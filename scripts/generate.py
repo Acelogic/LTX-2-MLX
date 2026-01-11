@@ -32,7 +32,7 @@ from LTX_2_MLX.model.audio_vae import (
 from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.types import VideoLatentShape
-from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights
+from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
 from LTX_2_MLX.model.video_vae.simple_decoder import (
     SimpleVideoDecoder,
     load_vae_decoder_weights,
@@ -703,7 +703,7 @@ def generate_video(
     pipeline_type: str = "text-to-video",
     early_layers_only: bool = False,
     enhance_prompt_flag: bool = False,
-    cross_attn_scale: float = 1.0,
+    cross_attn_scale: float = 1.0, distilled_lora: str = None, distilled_lora_scale: float = 1.0,
 ):
     """Generate video from text prompt."""
 
@@ -843,21 +843,33 @@ def generate_video(
             print("  Skipping model load (placeholder mode)")
 
     # Whether to use CFG
+    # Distilled models (LTX-2 distilled) are trained without CFG and produce artifacts if CFG > 1.0
+    # HOWEVER: Two-stage pipeline specifically uses CFG in Stage 1 (at low res), so we allow it there.
+    if model_variant == "distilled" and cfg_scale > 1.2 and pipeline_type != "two-stage":
+        print(f"  WARNING: Distilled model requires CFG=1.0 (no guidance). You requested {cfg_scale}.")
+        print(f"  Forcing CFG=1.0 to prevent visual artifacts.")
+        cfg_scale = 1.0
+        # Disable guidance rescale too since it's irrelevant without CFG
+        if guidance_rescale > 0:
+            guidance_rescale = 0.0
+
     use_cfg = cfg_scale > 1.0 and model is not None
     if use_cfg:
         print(f"  CFG enabled with scale {cfg_scale}")
         if guidance_rescale > 0:
             print(f"  Guidance rescale: {guidance_rescale}")
+    else:
+        print(f"  CFG disabled (scale {cfg_scale}) - Running optimized single-pass inference")
 
     # Load VAE decoder
     vae_decoder = None
-    if not skip_vae and weights_path:
-        dtype_name = "FP16" if use_fp16 else "FP32"
-        print(f"\n[3/5] Loading VAE decoder ({dtype_name})...")
+    if not skip_vae:
+        print(f"\n[3/5] Loading VAE decoder...")
         vae_decoder = SimpleVideoDecoder(compute_dtype=compute_dtype)
-        load_vae_decoder_weights(vae_decoder, weights_path)
-    elif not skip_vae:
-        print("\n[3/5] Skipping VAE decoder (no weights)")
+        if weights_path and not use_placeholder:
+             load_vae_decoder_weights(vae_decoder, weights_path)
+        elif use_placeholder:
+             print("  Skipping weights load (placeholder)")
     else:
         print("\n[3/5] VAE decoder skipped by user")
 
@@ -867,12 +879,37 @@ def generate_video(
         # Validate requirements
         if generate_audio:
             raise ValueError("Two-stage pipeline does not support audio generation mode. Use --pipeline text-to-video instead.")
+        
         if model is None:
-            raise ValueError("Two-stage pipeline requires a loaded model (cannot use placeholder mode)")
-        if vae_decoder is None:
+            if use_placeholder:
+                print("  Creating dummy model for placeholder Two-Stage pipeline...")
+                class MockModel:
+                    def __init__(self):
+                        self.velocity_model = self
+                    def parameters(self):
+                        return {}
+                    def __call__(self, *args, **kwargs):
+                        return mx.zeros((1))
+                    def load_weights(self, *args):
+                        pass
+                model = MockModel()
+            else:
+                raise ValueError("Two-stage pipeline requires a loaded model (cannot use placeholder mode)")
+
+        if vae_decoder is None and not use_placeholder:
             raise ValueError("Two-stage pipeline requires VAE decoder")
-        if not spatial_upscaler_weights or not weights_path:
+        
+        if (not spatial_upscaler_weights or not weights_path) and not use_placeholder:
             raise ValueError("Two-stage pipeline requires --spatial-upscaler-weights")
+
+        # Two-stage pipeline requires resolution divisible by 64 (for stage 1 half-res to be divisible by 32)
+        if height % 64 != 0 or width % 64 != 0:
+            new_height = ((height + 63) // 64) * 64
+            new_width = ((width + 63) // 64) * 64
+            print(f"  WARNING: Two-stage pipeline requires resolution divisible by 64.")
+            print(f"  Adjusting resolution from {height}x{width} to {new_height}x{new_width}")
+            height = new_height
+            width = new_width
 
         print("\n=== Using Two-Stage Pipeline ===")
         print(f"  Stage 1: {steps_stage1} steps at {height//2}x{width//2} with CFG {cfg_stage1 or cfg_scale}")
@@ -881,7 +918,10 @@ def generate_video(
         # Load spatial upscaler
         print("\n[3.5/5] Loading spatial upscaler...")
         spatial_upscaler = SpatialUpscaler()
-        load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
+        if not use_placeholder:
+            load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
+        else:
+            print("  Skipping weights load (placeholder)")
 
         # DEBUG: Check if weights are loaded
         print(f"DEBUG: initial_conv_weight stats - mean: {float(mx.mean(spatial_upscaler.initial_conv_weight)):.6f}, std: {float(mx.std(spatial_upscaler.initial_conv_weight.astype(mx.float32))):.6f}")
@@ -890,7 +930,10 @@ def generate_video(
         # Load video encoder
         print("[3.5/5] Loading VAE encoder...")
         video_encoder = SimpleVideoEncoder(compute_dtype=compute_dtype)
-        load_vae_encoder_weights(video_encoder, weights_path)
+        if not use_placeholder:
+            load_vae_encoder_weights(video_encoder, weights_path)
+        else:
+            print("  Skipping weights load (placeholder)")
 
         # Create two-stage pipeline
         print("\n[4/5] Creating two-stage pipeline...")
@@ -900,6 +943,14 @@ def generate_video(
             video_decoder=vae_decoder,
             spatial_upscaler=spatial_upscaler,
         )
+
+        # Create distilled LoRA config if provided
+        distilled_lora_config = None
+        if distilled_lora:
+            print(f"  Distilled LoRA: {distilled_lora} (scale {distilled_lora_scale})")
+            distilled_lora_config = LoRAConfig(path=distilled_lora, strength=distilled_lora_scale)
+        elif pipeline_type == "two-stage":
+             print("  WARNING: No distilled LoRA provided for two-stage pipeline. Stage 2 quality may be degraded.")
 
         # Create config
         config = TwoStageCFGConfig(
@@ -911,6 +962,7 @@ def generate_video(
             num_inference_steps=steps_stage1,
             cfg_scale=cfg_stage1 if cfg_stage1 is not None else cfg_scale,
             dtype=compute_dtype,
+            distilled_lora_config=distilled_lora_config,
         )
 
         # Run pipeline
@@ -1608,6 +1660,18 @@ def main():
         help="Model variant: 'distilled' (fast, 3-7 steps) or 'dev' (quality, 25-50 steps)"
     )
     parser.add_argument(
+        "--distilled-lora",
+        type=str,
+        default=None,
+        help="Path to distilled LoRA weights (required for high-quality two-stage generation)"
+    )
+    parser.add_argument(
+        "--distilled-lora-scale",
+        type=float,
+        default=1.0,
+        help="Scale for distilled LoRA (default 1.0)"
+    )
+    parser.add_argument(
         "--upscale-spatial",
         action="store_true",
         help="Apply 2x spatial upscaling to output (256->512, etc.)"
@@ -1721,6 +1785,9 @@ def main():
             print(f"Using FP8 weights: {args.weights}")
 
     generate_video(
+        distilled_lora=args.distilled_lora,
+        distilled_lora_scale=args.distilled_lora_scale,
+
         prompt=args.prompt,
         height=args.height,
         width=args.width,
