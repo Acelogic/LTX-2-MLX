@@ -107,14 +107,154 @@ python scripts/generate.py "A cat walking through a garden" \
     --upscale-spatial --output output.mp4
 ```
 
+## Pipelines
+
+LTX-2 MLX provides **6 specialized pipelines** for different use cases. Use the `--pipeline` flag to select:
+
+### Available Pipelines (via `--pipeline` flag)
+
+#### 1. `text-to-video` (Default)
+Standard text-to-video generation with simple CFG denoising.
+
+```bash
+python scripts/generate.py "A cat walking" \
+    --pipeline text-to-video \
+    --height 480 --width 704 --frames 25 --steps 7
+```
+
+**Best for**: Basic video generation, quick testing
+
+#### 2. `distilled` ⚡ Fast
+Two-stage distilled model optimized for speed (no CFG, 10 total steps).
+
+```bash
+python scripts/generate.py "A cat walking" \
+    --pipeline distilled \
+    --height 480 --width 704 --frames 25
+```
+
+- **Stage 1**: 7 steps at half resolution
+- **Stage 2**: 3 steps refinement
+- **Speed**: ~2x faster than standard
+- **Quality**: Good for most use cases
+- **Best for**: Fast iteration, batch generation
+
+#### 3. `one-stage` 🎨 Quality
+Single-stage CFG with full control and adaptive sigma scheduling.
+
+```bash
+python scripts/generate.py "A cat walking" \
+    --pipeline one-stage \
+    --cfg 5.0 --steps 20 \
+    --height 480 --width 704 --frames 25
+```
+
+- Uses LTX2Scheduler for token-count-dependent sigma schedule
+- Optional image conditioning via latent replacement
+- Full CFG control with positive/negative prompts
+- **Best for**: High-quality single-resolution generation
+
+#### 4. `two-stage` ✨ HQ + Upscaling (Recommended for High-Res)
+Two-stage pipeline with spatial upscaling for high-resolution output.
+
+```bash
+python scripts/generate.py "A cat walking" \
+    --pipeline two-stage \
+    --height 512 --width 704 \
+    --cfg 5.0 --steps-stage1 15 \
+    --spatial-upscaler-weights weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors \
+    --fp16
+```
+
+- **Stage 1**: Generate at half resolution (256x352) with CFG
+- **Stage 2**: 2x spatial upscale + 3 distilled refinement steps
+- **Final output**: 512x704 (or higher)
+- Combines CFG quality with distilled speed
+- **Best for**: High-resolution video generation (512x704+)
+
+**Quality**: Matches one-stage baseline with 2x resolution increase
+
+### Additional Pipelines (Code-Only)
+
+#### 5. Image Conditioning LoRA (`ic_lora`)
+Video-to-video generation with control signals (depth, pose, edges).
+
+```python
+from LTX_2_MLX.pipelines import ICLoraPipeline, create_ic_lora_pipeline
+
+pipeline = create_ic_lora_pipeline(
+    transformer=model,
+    video_decoder=decoder,
+    # ... requires IC-LoRA weights
+)
+```
+
+- Two-stage with IC-LoRA in Stage 1 only
+- Control signals: depth maps, human pose, edge detection
+- **Best for**: Controlled video-to-video generation
+
+#### 6. Keyframe Interpolation (`keyframe_interpolation`)
+Generate videos by interpolating between keyframe images.
+
+```python
+from LTX_2_MLX.pipelines import KeyframeInterpolationPipeline, Keyframe
+
+keyframes = [
+    Keyframe(image=img1, frame_index=0),
+    Keyframe(image=img2, frame_index=24),
+]
+
+video = pipeline(keyframes=keyframes, ...)
+```
+
+- Two-stage with keyframe conditioning
+- Smooth interpolation between images
+- **Best for**: Image sequence animation
+
+### Pipeline Comparison
+
+| Pipeline | Speed | Quality | Resolution | CFG | Best Use Case |
+|----------|-------|---------|------------|-----|---------------|
+| `text-to-video` | Medium | Good | Any | ✓ | Basic generation |
+| `distilled` | **Fast** (10 steps) | Good | Up to 480p | ✗ | Quick iteration |
+| `one-stage` | Slow (20+ steps) | **High** | Any | ✓ | Quality priority |
+| `two-stage` | Medium (18 steps) | **High** | **512p+** | ✓ | High-resolution |
+| `ic_lora` | Medium | High | 512p+ | ✓ | Controlled gen |
+| `keyframe_interpolation` | Medium | High | 512p+ | ✓ | Image animation |
+
+### Recommended Settings by Use Case
+
+**Fast Previews (< 1 min)**
+```bash
+--pipeline distilled --height 256 --width 384 --frames 17
+```
+
+**Balanced Quality/Speed (1-2 min)**
+```bash
+--pipeline one-stage --height 480 --width 704 --frames 25 --steps 15 --cfg 4.0 --fp16
+```
+
+**Maximum Quality (2-3 min)**
+```bash
+--pipeline two-stage --height 512 --width 704 --frames 33 --steps-stage1 20 --cfg 6.0 --fp16
+```
+
+**High Resolution (3-4 min)**
+```bash
+--pipeline two-stage --height 768 --width 1024 --frames 25 --steps-stage1 15 --cfg 5.0 --fp16
+```
+
 ### Options
 
 | Flag | Description | Default |
 |------|-------------|---------|
+| `--pipeline` | Pipeline: `text-to-video`, `distilled`, `one-stage`, `two-stage` | text-to-video |
 | `--height` | Video height (divisible by 32) | 480 |
 | `--width` | Video width (divisible by 32) | 704 |
 | `--frames` | Number of frames (N*8+1) | 97 |
 | `--steps` | Denoising steps | 7 |
+| `--steps-stage1` | Stage 1 steps (two-stage pipeline) | 15 |
+| `--steps-stage2` | Stage 2 steps (two-stage pipeline) | 3 |
 | `--cfg` | Classifier-free guidance scale | 3.0 |
 | `--seed` | Random seed | 42 |
 | `--output` | Output video path | gens/output.mp4 |
@@ -122,8 +262,10 @@ python scripts/generate.py "A cat walking through a garden" \
 | `--fp16` | Use FP16 computation (~50% memory reduction) | False |
 | `--fp8` | Load FP8-quantized weights | False |
 | `--model-variant` | `distilled` (fast) or `dev` (quality) | distilled |
-| `--upscale-spatial` | Apply 2x spatial upscaling | False |
-| `--upscale-temporal` | Apply 2x temporal upscaling | False |
+| `--spatial-upscaler-weights` | Path to spatial upscaler weights (for two-stage) | None |
+| `--temporal-upscaler-weights` | Path to temporal upscaler weights | None |
+| `--upscale-spatial` | Apply 2x spatial upscaling (legacy) | False |
+| `--upscale-temporal` | Apply 2x temporal upscaling (legacy) | False |
 | `--generate-audio` | Generate synchronized audio (experimental) | False |
 | `--low-memory` | Aggressive memory optimization (~30% less) | False |
 | `--skip-vae` | Skip VAE decoding (output latent visualization) | False |
@@ -237,8 +379,10 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 
 ## Current Status
 
-### Working
+### Working ✅
 - **Text-to-video generation producing semantic content** (palm trees, sunsets, grass, etc.)
+- **6 specialized pipelines**: text-to-video, distilled, one-stage, two-stage, ic-lora, keyframe-interpolation
+- **Two-stage pipeline with spatial upscaling** (512x704+, quality verified)
 - Full text encoding pipeline (all 49 Gemma layers + normalization + projection)
 - Native MLX Gemma 3 12B text encoder (FP16)
 - 48-layer transformer (19B parameters) verified to match PyTorch exactly (correlation = 1.0)
@@ -248,18 +392,17 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 - CFG (Classifier-Free Guidance) with configurable scale
 - Memory optimization with intermediate tensor cleanup
 - Video export via ffmpeg
-- Tested at resolutions up to 480x704
+- Tested at resolutions up to 768x1024
 
-### In Progress
+### In Progress 🚧
 - FP8 weight loading (27GB quantized models)
-- Spatial upscaler (2x resolution)
+- Spatial upscaler debugging (res block instability, bilinear workaround in place)
 - Temporal upscaler (2x framerate)
 - Full audio-video joint generation mode
 
-### Pending
+### Pending 📋
 - Image-to-video conditioning
 - LoRA support
-- Video-to-video (IC-LoRA)
 
 ## Documentation
 

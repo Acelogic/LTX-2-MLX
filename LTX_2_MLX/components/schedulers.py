@@ -246,9 +246,9 @@ DISTILLED_SIGMA_VALUES = [
 ]
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [
-    0.3,
-    0.15,
-    0.05,
+    0.909375,
+    0.725,
+    0.421875,
     0.0,
 ]
 

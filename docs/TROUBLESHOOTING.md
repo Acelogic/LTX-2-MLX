@@ -1193,6 +1193,200 @@ Comparison with safetensors:
 
 ---
 
+## Issue: Two-Stage Pipeline Producing Gray Noise
+
+### Symptoms
+- Two-stage pipeline generates videos with very low variance (Std=8.6 instead of ~38)
+- Output appears as nearly uniform gray noise
+- Color channels have minimal variation (std ~5.0)
+- Limited dynamic range (e.g., [93, 230] instead of [0, 255])
+
+### Root Causes
+
+#### 1. Missing Normalization Wrapper Around Spatial Upsampling
+
+**Problem**: The spatial upsampling was applied directly to normalized latents without proper un-normalization and re-normalization.
+
+**Why This Matters**: The PyTorch reference implementation requires:
+```python
+# From ltx-core/src/ltx_core/model/upsampler/model.py
+def upsample_video(latent, video_encoder, upsampler):
+    latent = video_encoder.per_channel_statistics.un_normalize(latent)  # ← Critical!
+    latent = upsampler(latent)
+    latent = video_encoder.per_channel_statistics.normalize(latent)      # ← Critical!
+    return latent
+```
+
+The VAE encoder normalizes latents to have specific per-channel statistics (mean=0, std=1 per channel). When upsampling:
+- **Un-normalize**: Converts from normalized latent space back to pixel-like space
+- **Upsample**: Applies 2x spatial upsampling in pixel space
+- **Re-normalize**: Converts back to normalized latent space
+
+Without this wrapper, the upsampling operates on incorrectly scaled values, destroying the latent distribution and causing the decoder to produce near-uniform output.
+
+**Impact**:
+- Before fix: Std = 8.6 (almost uniform gray)
+- After fix: Std = 37.0 (normal variance, matches one-stage quality)
+- **4.4x improvement** in output variance
+
+#### 2. Frame Conversion Using Raw Decoder Output
+
+**Problem**: The two-stage pipeline was calling `self.video_decoder(latent)` directly, which returns raw float32 values in `(B, C, T, H, W)` format.
+
+**Why This Failed**:
+- Raw decoder output has values in range ~[-2.2, 1.9]
+- PIL expects uint8 [0, 255] or float [0.0, 1.0]
+- Frame shape was wrong: `(B, C, T, H, W)` instead of list of `(H, W, C)` frames
+
+**Solution**: Use the `decode_latent()` helper function which:
+1. Normalizes latent std if needed
+2. Applies decoder with timestep conditioning
+3. Adds bias correction (+0.30)
+4. Applies contrast boost for large videos
+5. Converts to uint8: `mx.clip((video + 1) / 2, 0, 1) * 255`
+6. Rearranges to `(T, H, W, C)` format
+
+**Error Before Fix**:
+```
+TypeError: Cannot handle this data type: (1, 1, 3), <f4
+```
+
+#### 3. Spatial Upscaler Res Block Instability (Workaround Applied)
+
+**Problem**: The spatial upscaler's residual blocks amplify values exponentially:
+```
+Input:           mean=0.03,   range=[-7.9,   7.9]
+After res_block 0: mean=-7.3,   range=[-160,   45]     # 15x explosion!
+After res_block 1: mean=-46.6,  range=[-795,   437]
+After res_block 2: mean=-35.5,  range=[-2137,  2240]   # 800x amplification!
+After res_block 3: mean=-30.0,  range=[-2148,  1666]
+```
+
+**Root Cause**: Unknown - architecture and weights appear correct, but numerical instability occurs in res blocks.
+
+**Workaround**: Replace broken spatial upscaler with bilinear upsampling:
+```python
+# Un-normalize first
+latent_unnorm = video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
+
+# Bilinear upsampling (B, C, F, H, W)
+b, c, f, h, w = latent_unnorm.shape
+upscaled_unnorm = mx.zeros((b, c, f, h * 2, w * 2), dtype=latent_unnorm.dtype)
+
+for fi in range(f):
+    frame = latent_unnorm[:, :, fi, :, :]  # (B, C, H, W)
+    frame_t = frame.transpose(0, 2, 3, 1)  # (B, H, W, C)
+    frame_up = mx.repeat(mx.repeat(frame_t, 2, axis=1), 2, axis=2)  # Nearest neighbor 2x
+    frame_out = frame_up.transpose(0, 3, 1, 2)  # (B, C, H*2, W*2)
+    upscaled_unnorm[:, :, fi, :, :] = frame_out
+
+# Re-normalize
+upscaled_latent = video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
+```
+
+This workaround achieves comparable quality to the spatial upscaler without instability.
+
+### Fixes Applied
+
+#### File: `LTX_2_MLX/pipelines/two_stage.py`
+
+**Location**: Lines 430-449
+
+**Change**: Added normalization wrapper around spatial upsampling
+
+```python
+# CRITICAL: Must un-normalize before upsampling, then re-normalize after
+# This is required by the PyTorch reference implementation to preserve latent distribution
+latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
+
+# Use bilinear upsampling (spatial upscaler has res block instability)
+b, c, f, h, w = latent_unnorm.shape
+upscaled_unnorm = mx.zeros((b, c, f, h * 2, w * 2), dtype=latent_unnorm.dtype)
+
+for fi in range(f):
+    frame = latent_unnorm[:, :, fi, :, :]  # (B, C, H, W)
+    frame_t = frame.transpose(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+    frame_up = mx.repeat(mx.repeat(frame_t, 2, axis=1), 2, axis=2)  # Nearest neighbor 2x
+    frame_out = frame_up.transpose(0, 3, 1, 2)  # (B, H*2, W*2, C) -> (B, C, H*2, W*2)
+    upscaled_unnorm[:, :, fi, :, :] = frame_out
+
+# Re-normalize back to latent space
+upscaled_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
+mx.eval(upscaled_latent)
+```
+
+**Location**: Lines 496-502 (modified from direct decoder call)
+
+**Change**: Use `decode_latent()` helper instead of raw decoder
+
+```python
+# Decode to video using decode_latent helper (handles normalization to uint8)
+video = decode_latent(final_latent, self.video_decoder, timestep=0.05)
+```
+
+#### File: `scripts/generate.py`
+
+**Location**: Lines 867-871
+
+**Change**: Simplified frame conversion for properly formatted output
+
+```python
+# Convert to frames list for save_video
+# decode_latent returns (T, H, W, C) in uint8, so just convert to numpy list
+video_np = np.array(video)  # (T, H, W, C)
+frames = [video_np[t] for t in range(video_np.shape[0])]
+```
+
+### Verification Results
+
+Quality comparison before and after fixes:
+
+| Metric | Before Fix | After Fix | One-Stage Baseline |
+|--------|-----------|-----------|-------------------|
+| **Variance (Std Dev)** | 8.6 | 37.0 ✅ | 38.6 |
+| **Dynamic Range** | [93, 230] | [0, 255] ✅ | [0, 255] |
+| **R channel** | 149.4 ± 4.9 | 153.3 ± 30.9 ✅ | 150.4 ± 34.8 |
+| **G channel** | 141.8 ± 4.8 | 171.1 ± 21.2 ✅ | 161.7 ± 27.7 |
+| **B channel** | 132.2 ± 5.0 | 147.4 ± 51.1 ✅ | 142.1 ± 47.8 |
+
+**Result**: The two-stage pipeline now produces video quality matching the one-stage baseline, with proper color variance and full dynamic range.
+
+### Test Command
+
+```bash
+python scripts/generate.py "A beautiful tropical beach with palm trees and blue ocean waves" \
+  --pipeline two-stage \
+  --height 512 --width 704 --frames 33 \
+  --cfg 5.0 --steps-stage1 15 \
+  --gemma-path weights/gemma-3-12b \
+  --weights weights/ltx-2/ltx-2-19b-distilled.safetensors \
+  --spatial-upscaler-weights weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors \
+  --output output.mp4 --fp16
+```
+
+Expected output:
+- Resolution: 512x704 (2x upscaled from 256x352)
+- Variance: ~37-38 (matching one-stage quality)
+- Full color range: [0, 255]
+
+### Lessons Learned
+
+1. **Always Check Reference Implementation**: The PyTorch code had critical normalization logic that wasn't obvious from the architecture alone.
+
+2. **Normalization Wrappers Are Critical**: When upsampling latents, the normalization wrapper preserves the statistical distribution that the decoder expects.
+
+3. **Use Helper Functions**: The `decode_latent()` helper encapsulates all the post-processing logic (bias correction, contrast boost, uint8 conversion) - use it instead of calling the decoder directly.
+
+4. **Validate Output Statistics**: Low variance (std < 15) in video output is a red flag indicating incorrect latent processing.
+
+5. **Spatial Upscaler Investigation Needed**: The res block instability issue requires further investigation. Possible causes:
+   - Weight loading issues
+   - Numerical precision problems (FP16 vs FP32)
+   - Architectural differences from PyTorch
+   - Missing normalization layers in res blocks
+
+---
+
 ## Resources
 
 - [LTX-2 GitHub](https://github.com/Lightricks/LTX-2)

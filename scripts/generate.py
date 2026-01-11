@@ -54,6 +54,14 @@ from LTX_2_MLX.model.upscaler import (
     TemporalUpscaler,
     load_temporal_upscaler_weights,
 )
+from LTX_2_MLX.pipelines.two_stage import (
+    TwoStagePipeline,
+    TwoStageCFGConfig,
+)
+from LTX_2_MLX.model.video_vae.simple_encoder import (
+    SimpleVideoEncoder,
+    load_vae_encoder_weights,
+)
 
 # Try to import tqdm for progress bars
 try:
@@ -604,14 +612,18 @@ def generate_video(
     width: int = 704,
     num_frames: int = 97,  # 12 seconds at 8fps after VAE (97 = 1 + 12*8)
     num_steps: int = 7,  # Distilled model uses 7 steps
-    cfg_scale: float = 3.0,
+    cfg_scale: float = 5.0,  # Updated default for better semantic quality
     guidance_rescale: float = 0.7,  # Rescale CFG output to prevent variance explosion
+    # Two-stage pipeline parameters
+    steps_stage1: int = 15,
+    steps_stage2: int = 3,
+    cfg_stage1: float | None = None,  # Defaults to cfg_scale if not specified
     seed: int = 42,
-    weights_path: str = None,
+    weights_path: str | None = None,
     output_path: str = "gens/output.mp4",
     use_placeholder: bool = False,
     skip_vae: bool = False,
-    embedding_path: str = None,
+    embedding_path: str | None = None,
     gemma_path: str = "weights/gemma-3-12b",
     use_gemma: bool = True,
     use_fp16: bool = True,  # FP16 by default for memory efficiency
@@ -788,6 +800,83 @@ def generate_video(
     else:
         print("\n[3/5] VAE decoder skipped by user")
 
+    # === TWO-STAGE PIPELINE ===
+    # Use dedicated two-stage pipeline for higher quality generation
+    if pipeline_type == "two-stage":
+        # Validate requirements
+        if generate_audio:
+            raise ValueError("Two-stage pipeline does not support audio generation mode. Use --pipeline text-to-video instead.")
+        if model is None:
+            raise ValueError("Two-stage pipeline requires a loaded model (cannot use placeholder mode)")
+        if vae_decoder is None:
+            raise ValueError("Two-stage pipeline requires VAE decoder")
+        if not spatial_upscaler_weights or not weights_path:
+            raise ValueError("Two-stage pipeline requires --spatial-upscaler-weights")
+
+        print("\n=== Using Two-Stage Pipeline ===")
+        print(f"  Stage 1: {steps_stage1} steps at {height//2}x{width//2} with CFG {cfg_stage1 or cfg_scale}")
+        print(f"  Stage 2: 3 steps at {height}x{width} (distilled refinement)")
+
+        # Load spatial upscaler
+        print("\n[3.5/5] Loading spatial upscaler...")
+        # BUGFIX: Force spatial upscaler to use FP32 to avoid numerical issues
+        spatial_upscaler = SpatialUpscaler(compute_dtype=mx.float32)
+        load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
+
+        # DEBUG: Check if weights are loaded
+        print(f"DEBUG: initial_conv.weight stats - mean: {float(mx.mean(spatial_upscaler.initial_conv.weight)):.6f}, std: {float(mx.std(spatial_upscaler.initial_conv.weight.astype(mx.float32))):.6f}")
+        print(f"DEBUG: final_conv.weight stats - mean: {float(mx.mean(spatial_upscaler.final_conv.weight)):.6f}, std: {float(mx.std(spatial_upscaler.final_conv.weight.astype(mx.float32))):.6f}")
+        print(f"DEBUG: Using spatial upscaler with compute_dtype=FP32 to avoid numerical issues")
+
+        # Load video encoder
+        print("[3.5/5] Loading VAE encoder...")
+        video_encoder = SimpleVideoEncoder(compute_dtype=compute_dtype)
+        load_vae_encoder_weights(video_encoder, weights_path)
+
+        # Create two-stage pipeline
+        print("\n[4/5] Creating two-stage pipeline...")
+        pipeline = TwoStagePipeline(
+            transformer=model,
+            video_encoder=video_encoder,
+            video_decoder=vae_decoder,
+            spatial_upscaler=spatial_upscaler,
+        )
+
+        # Create config
+        config = TwoStageCFGConfig(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            fps=24.0,
+            num_inference_steps=steps_stage1,
+            cfg_scale=cfg_stage1 if cfg_stage1 is not None else cfg_scale,
+            dtype=compute_dtype,
+        )
+
+        # Run pipeline
+        print(f"\n[5/5] Running two-stage generation...")
+        video = pipeline(
+            positive_encoding=text_encoding,
+            positive_mask=text_mask,
+            negative_encoding=null_encoding,
+            negative_mask=null_mask,
+            config=config,
+        )
+
+        # Convert to frames list for save_video
+        # decode_latent returns (T, H, W, C) in uint8, so just convert to numpy list
+        video_np = np.array(video)  # (T, H, W, C)
+        frames = [video_np[t] for t in range(video_np.shape[0])]
+        print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
+
+        # Save video
+        print(f"\nSaving video to {output_path}...")
+        save_video(frames, output_path, fps=8)
+        print(f"Done! Video saved to {output_path}")
+        return
+
+    # === STANDARD PIPELINE (one-stage, distilled, etc.) ===
     # Initialize noise
     print("\n[4/5] Initializing latent noise...")
     latent = mx.random.normal(shape=(1, 128, latent_frames, latent_height, latent_width))
@@ -1391,9 +1480,12 @@ def main():
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=704, help="Video width")
     parser.add_argument("--frames", type=int, default=97, help="Number of frames")
-    parser.add_argument("--steps", type=int, default=8, help="Denoising steps (8 for distilled to reach sigma=0.0)")
-    parser.add_argument("--cfg", type=float, default=3.0, help="CFG scale")
+    parser.add_argument("--steps", type=int, default=8, help="Denoising steps (8 for distilled, 15+ for two-stage)")
+    parser.add_argument("--cfg", type=float, default=5.0, help="CFG scale (default 5.0 for better semantic quality)")
     parser.add_argument("--guidance-rescale", type=float, default=0.7, help="Guidance rescale factor (0.0=off, 0.7=default, 1.0=full)")
+    parser.add_argument("--steps-stage1", type=int, default=15, help="Stage 1 steps for two-stage pipeline")
+    parser.add_argument("--steps-stage2", type=int, default=3, help="Stage 2 refinement steps for two-stage pipeline")
+    parser.add_argument("--cfg-stage1", type=float, default=None, help="Stage 1 CFG (defaults to --cfg value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
     parser.add_argument("--output", type=str, default="gens/output.mp4", help="Output path")
     parser.add_argument(
@@ -1594,6 +1686,10 @@ def main():
         early_layers_only=args.early_layers_only,
         enhance_prompt_flag=args.enhance_prompt,
         cross_attn_scale=args.cross_attn_scale,
+        # Two-stage pipeline parameters
+        steps_stage1=args.steps_stage1,
+        steps_stage2=args.steps_stage2,
+        cfg_stage1=args.cfg_stage1,
     )
 
 
