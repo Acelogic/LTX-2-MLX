@@ -1251,7 +1251,7 @@ Without this wrapper, the upsampling operates on incorrectly scaled values, dest
 TypeError: Cannot handle this data type: (1, 1, 3), <f4
 ```
 
-#### 3. Spatial Upscaler Res Block Instability (Workaround Applied)
+#### 3. Spatial Upscaler Res Block Instability (Fix Applied)
 
 **Problem**: The spatial upscaler's residual blocks amplify values exponentially:
 ```
@@ -1262,9 +1262,11 @@ After res_block 2: mean=-35.5,  range=[-2137,  2240]   # 800x amplification!
 After res_block 3: mean=-30.0,  range=[-2148,  1666]
 ```
 
-**Root Cause**: Unknown - architecture and weights appear correct, but numerical instability occurs in res blocks.
+**Root Cause**: Residual blocks lacked output normalization after the residual addition, causing unconstrained value amplification across multiple blocks.
 
-**Workaround**: Replace broken spatial upscaler with bilinear upsampling:
+**Fix Applied** (as of 2026-01-11): Added output GroupNorm layer (`norm_out`) to ResBlock3d in `LTX_2_MLX/model/upscaler/spatial.py:159`. This stabilizes the residual connections by normalizing after each block's output. The layer initializes as identity transform (weight=1, bias=0) to preserve existing behavior until weights are learned/tuned.
+
+**Previous Workaround**: Replace broken spatial upscaler with nearest neighbor upsampling:
 ```python
 # Un-normalize first
 latent_unnorm = video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
@@ -1379,11 +1381,10 @@ Expected output:
 
 4. **Validate Output Statistics**: Low variance (std < 15) in video output is a red flag indicating incorrect latent processing.
 
-5. **Spatial Upscaler Investigation Needed**: The res block instability issue requires further investigation. Possible causes:
-   - Weight loading issues
-   - Numerical precision problems (FP16 vs FP32)
-   - Architectural differences from PyTorch
-   - Missing normalization layers in res blocks
+5. **Spatial Upscaler Fix**: Added output normalization to ResBlock3d (as of 2026-01-11). The fix adds a `norm_out` GroupNorm layer after residual addition to prevent value explosion. Further testing needed to verify stability with actual spatial upscaler weights. If instability persists, consider:
+   - Verifying weight loading correctness for norm_out layers
+   - Testing with different numerical precision (FP16 vs FP32)
+   - Comparing intermediate activations with PyTorch reference
 
 ---
 

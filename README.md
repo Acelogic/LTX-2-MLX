@@ -50,6 +50,23 @@ scripts/
 
 ### Dependencies
 
+#### Using `uv` (Recommended)
+
+The fastest way to get started - `uv` automatically manages dependencies:
+
+```bash
+# Install uv if you haven't already
+curl -LsSf https://astral.sh/uv/install.sh | sh
+
+# Run tests (uv handles all dependencies automatically)
+uv run pytest tests/ -m unit -v
+
+# Run video generation
+uv run python scripts/generate.py --prompt "Your prompt here"
+```
+
+#### Using `pip`
+
 ```bash
 pip install mlx safetensors numpy pillow tqdm transformers
 ```
@@ -396,13 +413,37 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 
 ### In Progress 🚧
 - FP8 weight loading (27GB quantized models)
-- Spatial upscaler debugging (res block instability, bilinear workaround in place)
 - Temporal upscaler (2x framerate)
-- Full audio-video joint generation mode
+- Full audio-video joint generation with two-stage pipeline
 
 ### Pending 📋
-- Image-to-video conditioning
-- LoRA support
+- Image-to-video conditioning via IC-LoRA (code exists, needs CLI integration)
+- Keyframe interpolation (code exists, needs testing)
+- LoRA support (infrastructure exists, needs weights and testing)
+
+## Known Limitations
+
+### Memory Requirements
+- **Text-to-Video (480×704, 97 frames)**: ~28GB RAM (FP32), ~18GB (FP16)
+- **Two-Stage Pipeline (960×1408, 97 frames)**: ~44GB RAM (FP32, sequential), ~59GB (parallel)
+- **With Audio Generation**: Add ~6GB for audio VAE + vocoder
+- **Recommendation**: Use `--low-memory` flag on systems with <32GB RAM
+
+### Text Embedding Quality
+- Gemma 3's self-attention homogenizes embeddings across different prompts
+- **Workaround**: `--early-layers-only` flag uses only initial embeddings (experimental)
+- Trade-off: Better prompt differentiation vs alignment with model training
+- See [TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md) for details
+
+### Audio Generation
+- Audio generation works with single-stage pipeline only
+- Two-stage pipeline does not yet support `--generate-audio` flag
+- Audio quality is experimental
+
+### Spatial Upscaling
+- Res-block based upscaler has been stabilized (output normalization added)
+- Previous bilinear workaround no longer required (as of 2026-01-11)
+- Spatial upscaler weights still recommended for best quality
 
 ## Documentation
 
