@@ -129,24 +129,27 @@ class GemmaFeaturesExtractorProjLinear(nn.Module):
         """
         Extract features from Gemma hidden states.
 
+        Uses ALL 49 hidden states, applies per-layer normalization, concatenates,
+        and projects through the learned linear layer - matching PyTorch exactly.
+
         Args:
-            hidden_states: List of hidden states from each Gemma layer.
+            hidden_states: List of hidden states from each Gemma layer (49 layers).
             attention_mask: Attention mask indicating valid tokens.
             padding_side: Side where padding is applied.
 
         Returns:
             Projected features of shape [batch, seq_len, hidden_dim].
         """
-        # Stack hidden states: [batch, seq_len, hidden_dim, num_layers]
+        # Stack all hidden states: list of [B, T, 3840] -> [B, T, 3840, 49]
         stacked = mx.stack(hidden_states, axis=-1)
 
         # Get sequence lengths from attention mask
         sequence_lengths = attention_mask.sum(axis=-1).astype(mx.int32)
 
-        # Normalize and concatenate
-        normed = norm_and_concat_padded_batch(
+        # Apply per-layer normalization and concatenation: [B, T, 3840, 49] -> [B, T, 3840*49]
+        normed_concat = norm_and_concat_padded_batch(
             stacked, sequence_lengths, padding_side=padding_side
         )
 
-        # Project to output dimension
-        return self.aggregate_embed(normed)
+        # Project through linear layer: [B, T, 3840*49] -> [B, T, 3840]
+        return self.aggregate_embed(normed_concat)

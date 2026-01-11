@@ -30,16 +30,20 @@ def load_safetensors(path: str) -> Dict[str, mx.array]:
 
 def transpose_linear_weights(weights: Dict[str, mx.array]) -> Dict[str, mx.array]:
     """
-    Transpose linear layer weights from PyTorch [out, in] to MLX [in, out].
+    Transpose 2D weight matrices in a weights dictionary.
 
-    MLX Linear expects weights of shape [in_features, out_features],
-    while PyTorch stores them as [out_features, in_features].
+    Note: Both MLX and PyTorch Linear layers store weights as [out_features, in_features],
+    so this function is NOT needed for standard weight loading. It exists for testing
+    and special cases where explicit transposition is required.
+
+    This function transposes 2D ".weight" tensors, excluding pure embeddings
+    (but including projection layers that contain "proj" in the name).
 
     Args:
         weights: Dictionary of weights.
 
     Returns:
-        Dictionary with transposed linear weights.
+        Dictionary with transposed 2D weight matrices.
     """
     transposed = {}
     for key, value in weights.items():
@@ -263,21 +267,23 @@ def extract_text_encoder_weights(
     return converted
 
 
-def convert_pytorch_key_to_mlx(pytorch_key: str) -> Optional[str]:
+def convert_pytorch_key_to_mlx(pytorch_key: str, include_audio: bool = False) -> Optional[str]:
     """
     Convert PyTorch weight key to MLX model key path.
 
     Args:
         pytorch_key: Original PyTorch key (after removing model.diffusion_model.).
+        include_audio: If True, include audio/av_ca related keys.
 
     Returns:
         MLX-compatible key path, or None if should be skipped.
     """
     key = pytorch_key
 
-    # Skip audio/video cross-attention keys
-    if "av_ca" in key or "audio" in key.lower():
-        return None
+    # Skip audio/video cross-attention keys unless explicitly included
+    if not include_audio:
+        if "av_ca" in key or "audio" in key.lower():
+            return None
 
     # Skip video_embeddings_connector for now (text encoder part)
     if "video_embeddings_connector" in key:
@@ -292,6 +298,12 @@ def convert_pytorch_key_to_mlx(pytorch_key: str) -> Optional[str]:
     # Handle ff.net.2 -> ff.project_out
     key = re.sub(r"\.ff\.net\.2\.", ".ff.project_out.", key)
 
+    # Handle audio ff.net.0.proj -> audio_ff.project_in.proj
+    key = re.sub(r"\.audio_ff\.net\.0\.proj\.", ".audio_ff.project_in.proj.", key)
+
+    # Handle audio ff.net.2 -> audio_ff.project_out
+    key = re.sub(r"\.audio_ff\.net\.2\.", ".audio_ff.project_out.", key)
+
     return key
 
 
@@ -299,6 +311,10 @@ def load_transformer_weights(
     model: nn.Module,
     weights_path: str,
     strict: bool = False,
+    use_fp8: bool = False,
+    include_audio: bool = False,
+    streaming: bool = True,
+    target_dtype: str = "float16",
 ) -> None:
     """
     Load transformer weights into an MLX model.
@@ -307,8 +323,13 @@ def load_transformer_weights(
         model: MLX model to load weights into.
         weights_path: Path to safetensors file.
         strict: If True, raise error on missing/extra keys.
+        use_fp8: If True, handle FP8 quantized weights with dequantization.
+        include_audio: If True, include audio-related weights (for AudioVideo model).
+        streaming: If True, use memory-efficient streaming load (default True).
+        target_dtype: Target dtype after dequantization ("float16" or "float32").
     """
     from safetensors import safe_open
+    import gc
 
     try:
         from tqdm import tqdm
@@ -316,6 +337,14 @@ def load_transformer_weights(
     except ImportError:
         has_tqdm = False
         print(f"Loading weights from {weights_path}...")
+
+    # Check for FP8 and load scales if needed
+    fp8_scales = {}
+    if use_fp8:
+        with safe_open(weights_path, framework="pt") as f:
+            for key in f.keys():
+                if key.endswith(".weight_scale"):
+                    fp8_scales[key.replace(".weight_scale", ".weight")] = f.get_tensor(key).item()
 
     # Build the weights dictionary for model.update()
     weights_dict = {}
@@ -338,18 +367,42 @@ def load_transformer_weights(
             key = pytorch_key.replace("model.diffusion_model.", "")
 
             # Convert key
-            mlx_key = convert_pytorch_key_to_mlx(key)
+            mlx_key = convert_pytorch_key_to_mlx(key, include_audio=include_audio)
             if mlx_key is None:
                 skipped_count += 1
                 continue
 
-            # Load tensor and convert to float32/float16 if needed
+            # Load tensor and convert to target dtype
             tensor = f.get_tensor(pytorch_key)
-            # Handle BFloat16 by converting to float32 first
             import torch
-            if tensor.dtype == torch.bfloat16:
-                tensor = tensor.to(torch.float32)
-            value = mx.array(tensor.numpy())
+
+            # Determine target torch dtype for memory efficiency
+            torch_target = torch.float16 if target_dtype == "float16" else torch.float32
+
+            # Handle FP8 quantized weights
+            if use_fp8 and pytorch_key in fp8_scales:
+                # FP8 weight - dequantize using scale, then convert to target dtype
+                scale = fp8_scales[pytorch_key]
+                tensor = (tensor.to(torch.float32) * scale).to(torch_target)
+            elif tensor.dtype == torch.bfloat16:
+                # Handle BFloat16 by converting to target dtype
+                tensor = tensor.to(torch_target)
+            elif hasattr(torch, 'float8_e4m3fn') and tensor.dtype == torch.float8_e4m3fn:
+                # FP8 without scale (shouldn't happen but handle gracefully)
+                tensor = tensor.to(torch_target)
+            elif tensor.dtype != torch_target and tensor.dtype in (torch.float32, torch.float16):
+                # Convert other float types to target dtype
+                tensor = tensor.to(torch_target)
+
+            # Convert to MLX array
+            np_array = tensor.numpy()
+            value = mx.array(np_array)
+
+            # MEMORY OPTIMIZATION: Delete torch tensor and numpy array immediately
+            # This prevents double memory usage during weight loading
+            if streaming:
+                del tensor
+                del np_array
 
             # Note: MLX Linear stores weights as [out_features, in_features],
             # same as PyTorch, so we do NOT transpose Linear weights.
@@ -357,6 +410,15 @@ def load_transformer_weights(
 
             weights_dict[mlx_key] = value
             loaded_count += 1
+
+            # MEMORY OPTIMIZATION: Periodic garbage collection during streaming
+            # Every 100 weights, clean up to prevent memory fragmentation
+            if streaming and loaded_count % 100 == 0:
+                gc.collect()
+
+    # Final cleanup before model update
+    if streaming:
+        gc.collect()
 
     print(f"  Converted {loaded_count} weight tensors (skipped {skipped_count})")
 
@@ -446,3 +508,32 @@ def load_mlx_weights(path: str) -> Dict[str, mx.array]:
         Dictionary of weights.
     """
     return dict(mx.load(path))
+
+
+def load_av_transformer_weights(
+    model: nn.Module,
+    weights_path: str,
+    strict: bool = False,
+    use_fp8: bool = False,
+    target_dtype: str = "float16",
+) -> None:
+    """
+    Load AudioVideo transformer weights into an MLX model.
+
+    Convenience function that calls load_transformer_weights with include_audio=True.
+
+    Args:
+        model: MLX AudioVideo model to load weights into.
+        weights_path: Path to safetensors file.
+        strict: If True, raise error on missing/extra keys.
+        use_fp8: If True, handle FP8 quantized weights with dequantization.
+        target_dtype: Target dtype after dequantization ("float16" or "float32").
+    """
+    load_transformer_weights(
+        model=model,
+        weights_path=weights_path,
+        strict=strict,
+        use_fp8=use_fp8,
+        include_audio=True,
+        target_dtype=target_dtype,
+    )

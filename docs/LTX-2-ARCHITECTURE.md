@@ -280,6 +280,34 @@ User Prompt + System Prompt → Gemma 3 (12B decoder-only LLM)
 - **Separate Contexts**: Video and audio get different embeddings optimized for their modality
 - **Learnable Registers**: "Thinking tokens" for contextual mixing
 
+### Text Encoder Pipeline (MLX Implementation)
+
+```
+Gemma 3 Forward Pass → 49 Hidden States [B, T, 3840] each
+                              ↓
+Feature Extractor (CRITICAL - must use all 49 layers):
+  Stack all layers → [B, T, 3840, 49]
+  Per-layer normalization (norm_and_concat_padded_batch):
+    - Compute masked mean per layer
+    - Compute masked min/max per layer
+    - Normalize: 8 * (x - mean) / range
+  Concatenate → [B, T, 188160]
+  Linear projection (aggregate_embed) → [B, T, 3840]
+                              ↓
+Embeddings Connector:
+  Replace padding with learnable registers (128 tokens, tiled to fill padding)
+  2x Transformer blocks with RoPE (30 heads, 128 dim/head)
+  Final RMSNorm
+                              ↓
+Caption Projection (in transformer):
+  Linear 3840 → 4096 (with SiLU)
+  Linear 4096 → 4096
+                              ↓
+Cross-Attention Context [B, T, 4096]
+```
+
+**Important**: The feature extractor MUST use all 49 Gemma layers with proper normalization. Using only the final layer produces embeddings that don't match what the model was trained with, resulting in noise output.
+
 ---
 
 ## LoRA Support

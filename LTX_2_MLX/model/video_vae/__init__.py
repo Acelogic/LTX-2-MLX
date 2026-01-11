@@ -31,6 +31,18 @@ from .simple_decoder import (
     load_vae_decoder_weights,
     decode_latent,
 )
+from .simple_encoder import (
+    SimpleVideoEncoder,
+    load_vae_encoder_weights,
+    encode_video,
+)
+from .tiling import (
+    TilingConfig,
+    SpatialTilingConfig,
+    TemporalTilingConfig,
+    decode_tiled,
+    compute_trapezoidal_mask_1d,
+)
 
 __all__ = [
     # Convolution
@@ -66,4 +78,14 @@ __all__ = [
     "SimpleVideoDecoder",
     "load_vae_decoder_weights",
     "decode_latent",
+    # Simple encoder (for weight loading)
+    "SimpleVideoEncoder",
+    "load_vae_encoder_weights",
+    "encode_video",
+    # Tiling
+    "TilingConfig",
+    "SpatialTilingConfig",
+    "TemporalTilingConfig",
+    "decode_tiled",
+    "compute_trapezoidal_mask_1d",
 ]

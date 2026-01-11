@@ -168,6 +168,7 @@ class AdaLayerNormSingle(nn.Module):
     Adaptive Layer Norm with scale and shift from timestep embedding.
 
     Used for conditioning transformer blocks on timestep information.
+    Returns both processed AdaLN parameters and raw embedded timestep.
     """
 
     def __init__(
@@ -183,7 +184,7 @@ class AdaLayerNormSingle(nn.Module):
         self.silu = nn.SiLU()
         self.linear = nn.Linear(embedding_dim, num_embeddings * embedding_dim, bias=True)
 
-    def __call__(self, timestep: mx.array) -> mx.array:
+    def __call__(self, timestep: mx.array) -> tuple:
         """
         Compute AdaLN parameters from timestep.
 
@@ -191,9 +192,11 @@ class AdaLayerNormSingle(nn.Module):
             timestep: Timestep values.
 
         Returns:
-            AdaLN parameters (scale, shift, gate values).
+            Tuple of:
+            - AdaLN parameters (scale, shift, gate values), shape (B, num_embeddings * dim)
+            - Raw embedded timestep (before linear), shape (B, dim)
         """
-        emb = self.emb(timestep)
-        emb = self.silu(emb)
+        embedded_timestep = self.emb(timestep)
+        emb = self.silu(embedded_timestep)
         emb = self.linear(emb)
-        return emb
+        return emb, embedded_timestep

@@ -97,7 +97,7 @@ class Attention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         norm_eps: float = 1e-6,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
     ):
         """
         Initialize attention module.
@@ -201,7 +201,7 @@ class SelfAttention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         norm_eps: float = 1e-6,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
     ):
         super().__init__()
         self.attn = Attention(

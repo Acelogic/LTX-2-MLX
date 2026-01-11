@@ -10,11 +10,14 @@ from .attention import (
 )
 from .feed_forward import FeedForward, GELUApprox, SwiGLU
 from .model import (
+    LTXAVModel,
     LTXModel,
     LTXModelType,
     Modality,
+    MultiModalTransformerArgsPreprocessor,
     PixArtAlphaTextProjection,
     TransformerArgsPreprocessor,
+    X0AVModel,
     X0Model,
 )
 from .rope import (
@@ -31,6 +34,7 @@ from .timestep_embedding import (
     get_timestep_embedding,
 )
 from .transformer import (
+    BasicAVTransformerBlock,
     BasicTransformerBlock,
     TransformerArgs,
     TransformerBlocks,
@@ -64,12 +68,18 @@ __all__ = [
     "TransformerConfig",
     "TransformerArgs",
     "BasicTransformerBlock",
+    "BasicAVTransformerBlock",
     "TransformerBlocks",
-    # Full model
+    # Video-only model
     "LTXModelType",
     "LTXModel",
     "X0Model",
+    "TransformerArgsPreprocessor",
+    # AudioVideo model
+    "LTXAVModel",
+    "X0AVModel",
+    "MultiModalTransformerArgsPreprocessor",
+    # Shared
     "Modality",
     "PixArtAlphaTextProjection",
-    "TransformerArgsPreprocessor",
 ]

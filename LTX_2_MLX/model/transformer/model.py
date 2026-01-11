@@ -7,10 +7,9 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .attention import rms_norm
 from .rope import LTXRopeType, precompute_freqs_cis
 from .timestep_embedding import AdaLayerNormSingle
-from .transformer import BasicTransformerBlock, TransformerArgs
+from .transformer import BasicTransformerBlock, BasicAVTransformerBlock, TransformerArgs, TransformerConfig
 
 
 class LTXModelType(Enum):
@@ -74,7 +73,7 @@ class TransformerArgsPreprocessor:
     - Patchify projection (linear embedding)
     - Timestep embedding via AdaLN
     - Caption projection
-    - Position embedding computation (RoPE)
+    - Position embedding computation (RoPE) with caching
     """
 
     def __init__(
@@ -88,7 +87,8 @@ class TransformerArgsPreprocessor:
         use_middle_indices_grid: bool = True,
         timestep_scale_multiplier: int = 1000,
         positional_embedding_theta: float = 10000.0,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
+        cache_position_embeddings: bool = True,
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -100,6 +100,9 @@ class TransformerArgsPreprocessor:
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
+        self.cache_position_embeddings = cache_position_embeddings
+        # Cache for position embeddings indexed by shape tuple
+        self._pe_cache = {}
 
     def _prepare_timestep(
         self,
@@ -117,16 +120,17 @@ class TransformerArgsPreprocessor:
             Tuple of (timestep_emb, embedded_timestep).
         """
         timestep = timestep * self.timestep_scale_multiplier
-        emb = self.adaln(timestep.flatten())
+        # AdaLayerNormSingle now returns tuple of (processed_emb, raw_embedded_timestep)
+        emb, embedded_timestep = self.adaln(timestep.flatten())
 
-        # Reshape to (B, num_embeddings, inner_dim)
-        # The adaln returns (B, num_embeddings * inner_dim)
+        # Reshape processed emb to (B, num_tokens, num_embeddings, inner_dim)
+        # The processed emb has shape (B, num_embeddings * inner_dim)
         num_embeddings = 6  # scale, shift, gate for self-attn and ffn
         emb = emb.reshape(batch_size, -1, num_embeddings, self.inner_dim)
 
-        # embedded_timestep is used for final output modulation
-        # Just take the mean across embedding dimension for the embedded version
-        embedded_timestep = emb[:, :, :2, :].mean(axis=2)
+        # Reshape raw embedded_timestep to (B, num_tokens, inner_dim)
+        # This is the pre-linear embedding used for final output modulation
+        embedded_timestep = embedded_timestep.reshape(batch_size, -1, self.inner_dim)
 
         return emb, embedded_timestep
 
@@ -178,14 +182,23 @@ class TransformerArgsPreprocessor:
         positions: mx.array,
     ) -> Tuple[mx.array, mx.array]:
         """
-        Prepare RoPE positional embeddings.
+        Prepare RoPE positional embeddings with caching.
+
+        Position embeddings are expensive to compute but only depend on the
+        position grid shape, not the actual latent values. During denoising,
+        the latent shape stays constant, so we can cache and reuse embeddings.
 
         Args:
-            positions: Position indices, shape (B, n_dims, T).
+            positions: Position indices, shape (B, n_dims, T, 2) where last dim is [start, end].
 
         Returns:
             Tuple of (cos_freq, sin_freq) for RoPE.
         """
+        # Use shape as cache key (positions have same shape across denoising steps)
+        cache_key = positions.shape
+        if self.cache_position_embeddings and cache_key in self._pe_cache:
+            return self._pe_cache[cache_key]
+
         pe = precompute_freqs_cis(
             indices_grid=positions,
             dim=self.inner_dim,
@@ -196,6 +209,11 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             rope_type=self.rope_type,
         )
+
+        # Cache the result
+        if self.cache_position_embeddings:
+            self._pe_cache[cache_key] = pe
+
         return pe
 
     def prepare(self, modality: Modality) -> TransformerArgs:
@@ -236,6 +254,128 @@ class TransformerArgsPreprocessor:
         )
 
 
+class MultiModalTransformerArgsPreprocessor:
+    """
+    Preprocesses inputs for AudioVideo transformer blocks.
+
+    Extends TransformerArgsPreprocessor to handle cross-modal attention:
+    - Separate positional embeddings for cross-attention (with caching)
+    - Cross-attention timestep embeddings (scale/shift and gate)
+    """
+
+    def __init__(
+        self,
+        simple_preprocessor: TransformerArgsPreprocessor,
+        cross_scale_shift_adaln: AdaLayerNormSingle,
+        cross_gate_adaln: AdaLayerNormSingle,
+        cross_pe_max_pos: int,
+        audio_cross_attention_dim: int,
+        av_ca_timestep_scale_multiplier: int = 1000,
+    ):
+        """
+        Initialize multi-modal preprocessor.
+
+        Args:
+            simple_preprocessor: Base preprocessor for video/audio.
+            cross_scale_shift_adaln: AdaLN for cross-attention scale/shift.
+            cross_gate_adaln: AdaLN for cross-attention gate.
+            cross_pe_max_pos: Max position for cross-modal RoPE.
+            audio_cross_attention_dim: Dimension for audio cross-attention.
+            av_ca_timestep_scale_multiplier: Scale for cross-attention timestep.
+        """
+        self.simple_preprocessor = simple_preprocessor
+        self.cross_scale_shift_adaln = cross_scale_shift_adaln
+        self.cross_gate_adaln = cross_gate_adaln
+        self.cross_pe_max_pos = cross_pe_max_pos
+        self.audio_cross_attention_dim = audio_cross_attention_dim
+        self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
+        # Cache for cross-modal position embeddings
+        self._cross_pe_cache = {}
+
+    def _prepare_cross_positional_embeddings(
+        self,
+        positions: mx.array,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Prepare cross-modal positional embeddings with caching.
+
+        Uses only the temporal dimension for cross-modal attention.
+        """
+        # Use shape as cache key
+        cache_key = positions.shape
+        if cache_key in self._cross_pe_cache:
+            return self._cross_pe_cache[cache_key]
+
+        # Use only the first dimension (temporal) for cross-modal attention
+        temporal_positions = positions[:, 0:1, :]
+
+        pe = precompute_freqs_cis(
+            indices_grid=temporal_positions,
+            dim=self.audio_cross_attention_dim,
+            out_dtype=mx.float32,
+            theta=self.simple_preprocessor.positional_embedding_theta,
+            max_pos=[self.cross_pe_max_pos],
+            use_middle_indices_grid=True,
+            num_attention_heads=self.simple_preprocessor.num_attention_heads,
+            rope_type=self.simple_preprocessor.rope_type,
+        )
+
+        # Cache the result
+        self._cross_pe_cache[cache_key] = pe
+        return pe
+
+    def _prepare_cross_attention_timestep(
+        self,
+        timestep: mx.array,
+        batch_size: int,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Prepare cross-attention timestep embeddings.
+
+        Returns scale/shift and gate embeddings separately.
+        """
+        scaled_timestep = timestep * self.simple_preprocessor.timestep_scale_multiplier
+
+        # Scale/shift timestep (AdaLayerNormSingle returns tuple, we only need processed emb)
+        scale_shift_emb, _ = self.cross_scale_shift_adaln(scaled_timestep.flatten())
+        scale_shift_emb = scale_shift_emb.reshape(batch_size, -1, 4, self.simple_preprocessor.inner_dim)
+
+        # Gate timestep (with AV CA scale)
+        av_ca_factor = self.av_ca_timestep_scale_multiplier / self.simple_preprocessor.timestep_scale_multiplier
+        gate_emb, _ = self.cross_gate_adaln((scaled_timestep * av_ca_factor).flatten())
+        gate_emb = gate_emb.reshape(batch_size, -1, 1, self.simple_preprocessor.inner_dim)
+
+        return scale_shift_emb, gate_emb
+
+    def prepare(self, modality: Modality) -> TransformerArgs:
+        """
+        Prepare all inputs for AudioVideo transformer blocks.
+
+        Args:
+            modality: Input modality data (video or audio).
+
+        Returns:
+            TransformerArgs with cross-modal attention fields populated.
+        """
+        # Get basic transformer args
+        args = self.simple_preprocessor.prepare(modality)
+
+        # Add cross-modal positional embeddings
+        cross_pe = self._prepare_cross_positional_embeddings(modality.positions)
+
+        # Add cross-attention timestep embeddings
+        batch_size = args.x.shape[0]
+        cross_scale_shift, cross_gate = self._prepare_cross_attention_timestep(
+            modality.timesteps, batch_size
+        )
+
+        return args.replace(
+            cross_positional_embeddings=cross_pe,
+            cross_scale_shift_timestep=cross_scale_shift,
+            cross_gate_timestep=cross_gate,
+        )
+
+
 class LTXModel(nn.Module):
     """
     LTX-2 Transformer model (video-only variant).
@@ -264,8 +404,11 @@ class LTXModel(nn.Module):
         positional_embedding_max_pos: Optional[List[int]] = None,
         timestep_scale_multiplier: int = 1000,
         use_middle_indices_grid: bool = True,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         compute_dtype: mx.Dtype = mx.float32,
+        low_memory: bool = False,
+        cross_attn_scale_late: float = 1.0,
+        cross_attn_scale_start_layer: int = 40,
     ):
         """
         Initialize LTX model.
@@ -284,8 +427,15 @@ class LTXModel(nn.Module):
             positional_embedding_max_pos: Max positions [time, height, width].
             timestep_scale_multiplier: Scale for timestep (1000).
             use_middle_indices_grid: Use middle of position bounds for RoPE.
-            rope_type: Type of RoPE (INTERLEAVED).
+            rope_type: Type of RoPE (SPLIT).
             compute_dtype: Dtype for computation (float32 or float16).
+            low_memory: If True, use aggressive memory optimization (eval every 4 layers).
+            cross_attn_scale_late: Cross-attention scaling for late layers.
+                Higher values (5-10) increase text conditioning influence and
+                preserve semantic differentiation in late transformer layers.
+                Default 1.0 (no scaling).
+            cross_attn_scale_start_layer: Layer at which to start applying
+                cross_attn_scale_late. Default 40.
         """
         super().__init__()
 
@@ -299,6 +449,9 @@ class LTXModel(nn.Module):
         self.use_middle_indices_grid = use_middle_indices_grid
         self.norm_eps = norm_eps
         self.compute_dtype = compute_dtype
+        self.low_memory = low_memory
+        # Eval frequency: every 4 layers for low_memory, every 8 otherwise
+        self._eval_frequency = 4 if low_memory else 8
 
         if positional_embedding_max_pos is None:
             positional_embedding_max_pos = [20, 2048, 2048]
@@ -320,6 +473,7 @@ class LTXModel(nn.Module):
         )
 
         # Transformer blocks
+        # Apply cross_attn_scale_late to late layers for better text differentiation
         self.transformer_blocks = [
             BasicTransformerBlock(
                 dim=self.inner_dim,
@@ -328,12 +482,15 @@ class LTXModel(nn.Module):
                 context_dim=cross_attention_dim,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
+                cross_attn_scale=cross_attn_scale_late if i >= cross_attn_scale_start_layer else 1.0,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ]
 
         # Output projection
-        self.scale_shift_table = mx.zeros((2, self.inner_dim))
+        # Note: scale_shift_table kept as float32 for numerical stability, even in FP16 mode
+        self.scale_shift_table = mx.zeros((2, self.inner_dim), dtype=mx.float32)
+        self.norm_out = nn.LayerNorm(self.inner_dim, affine=False, eps=norm_eps)
         self.proj_out = nn.Linear(self.inner_dim, out_channels)
 
         # Create preprocessor
@@ -350,6 +507,25 @@ class LTXModel(nn.Module):
             rope_type=self.rope_type,
         )
 
+    def set_cross_attn_scale(
+        self,
+        scale: float,
+        start_layer: int = 40,
+    ) -> None:
+        """
+        Set cross-attention scaling for late layers.
+
+        This can be called after model initialization/weight loading to
+        adjust cross-attention scaling without recreating the model.
+
+        Args:
+            scale: Cross-attention scale factor. Higher values (5-10) increase
+                text conditioning influence in late layers.
+            start_layer: Layer at which to start applying scaling. Default 40.
+        """
+        for i, block in enumerate(self.transformer_blocks):
+            block.cross_attn_scale = scale if i >= start_layer else 1.0
+
     def _process_transformer_blocks(
         self,
         args: TransformerArgs,
@@ -365,9 +541,10 @@ class LTXModel(nn.Module):
         """
         for i, block in enumerate(self.transformer_blocks):
             args = block(args)
-            # Force evaluation every 8 layers to release intermediate tensors
+            # Force evaluation periodically to release intermediate tensors
             # This reduces peak memory by preventing lazy evaluation buildup
-            if (i + 1) % 8 == 0:
+            # low_memory mode: every 4 layers, normal: every 8 layers
+            if (i + 1) % self._eval_frequency == 0:
                 mx.eval(args.x)
         return args
 
@@ -396,7 +573,7 @@ class LTXModel(nn.Module):
         scale = scale_shift_values[:, :, 1, :]  # (B, T, inner_dim)
 
         # Apply layer norm and modulation
-        x = rms_norm(x, eps=self.norm_eps)
+        x = self.norm_out(x)
         x = x * (1 + scale) + shift
 
         # Project to output channels
@@ -481,3 +658,402 @@ class X0Model(nn.Module):
 
         denoised = video.latent - timesteps * velocity
         return denoised
+
+
+class LTXAVModel(nn.Module):
+    """
+    LTX-2 AudioVideo Transformer model.
+
+    Architecture:
+    - Input: Patchified video latents + audio latents
+    - 48 transformer blocks with:
+      - Video self-attention, cross-attention (text), cross-attention (audio)
+      - Audio self-attention, cross-attention (text), cross-attention (video)
+      - Video and audio FFN
+    - AdaLN conditioning on timestep
+    - Output: Velocity predictions for both video and audio
+
+    The cross-modal attention enables synchronized audio-video generation.
+    """
+
+    # Audio configuration constants
+    AUDIO_ATTENTION_HEADS = 32
+    AUDIO_HEAD_DIM = 64
+    AUDIO_IN_CHANNELS = 128  # Audio VAE latent channels
+    AUDIO_OUT_CHANNELS = 128
+    AUDIO_CROSS_PE_MAX_POS = 16384
+
+    def __init__(
+        self,
+        # Video config
+        num_attention_heads: int = 32,
+        attention_head_dim: int = 128,
+        in_channels: int = 128,
+        out_channels: int = 128,
+        num_layers: int = 48,
+        cross_attention_dim: int = 4096,
+        # Shared config
+        norm_eps: float = 1e-6,
+        caption_channels: int = 3840,
+        positional_embedding_theta: float = 10000.0,
+        positional_embedding_max_pos: Optional[List[int]] = None,
+        timestep_scale_multiplier: int = 1000,
+        av_ca_timestep_scale_multiplier: int = 1000,
+        use_middle_indices_grid: bool = True,
+        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+        compute_dtype: mx.Dtype = mx.float32,
+        low_memory: bool = False,
+    ):
+        """
+        Initialize LTX AudioVideo model.
+
+        Args:
+            num_attention_heads: Number of video attention heads (32).
+            attention_head_dim: Video dimension per head (128).
+            in_channels: Video input channels from VAE (128).
+            out_channels: Video output channels (128).
+            num_layers: Number of transformer blocks (48).
+            cross_attention_dim: Text context dimension (4096).
+            norm_eps: Epsilon for normalization.
+            caption_channels: Caption embedding dimension (3840 from Gemma).
+            positional_embedding_theta: Base theta for RoPE.
+            positional_embedding_max_pos: Max positions [time, height, width].
+            timestep_scale_multiplier: Scale for timestep (1000).
+            av_ca_timestep_scale_multiplier: Scale for AV cross-attention timestep.
+            use_middle_indices_grid: Use middle of position bounds for RoPE.
+            rope_type: Type of RoPE (INTERLEAVED).
+            compute_dtype: Dtype for computation (float32 or float16).
+            low_memory: If True, use aggressive memory optimization (eval every 4 layers).
+        """
+        super().__init__()
+
+        self.rope_type = rope_type
+        self.timestep_scale_multiplier = timestep_scale_multiplier
+        self.positional_embedding_theta = positional_embedding_theta
+        self.use_middle_indices_grid = use_middle_indices_grid
+        self.norm_eps = norm_eps
+        self.compute_dtype = compute_dtype
+        self.num_layers = num_layers
+        self.low_memory = low_memory
+        # Eval frequency: every 4 layers for low_memory, every 8 otherwise
+        self._eval_frequency = 4 if low_memory else 8
+
+        if positional_embedding_max_pos is None:
+            positional_embedding_max_pos = [20, 2048, 2048]
+        self.positional_embedding_max_pos = positional_embedding_max_pos
+
+        self.num_attention_heads = num_attention_heads
+        self.video_inner_dim = num_attention_heads * attention_head_dim  # 4096
+        self.audio_inner_dim = self.AUDIO_ATTENTION_HEADS * self.AUDIO_HEAD_DIM  # 2048
+
+        # =================
+        # VIDEO COMPONENTS
+        # =================
+        # Input projection: latent -> inner_dim
+        self.patchify_proj = nn.Linear(in_channels, self.video_inner_dim, bias=True)
+
+        # AdaLN for timestep conditioning
+        self.adaln_single = AdaLayerNormSingle(self.video_inner_dim)
+
+        # Caption projection
+        self.caption_projection = PixArtAlphaTextProjection(
+            in_features=caption_channels,
+            hidden_size=self.video_inner_dim,
+        )
+
+        # Output projection
+        # Note: scale_shift_table kept as float32 for numerical stability, even in FP16 mode
+        self.scale_shift_table = mx.zeros((2, self.video_inner_dim), dtype=mx.float32)
+        self.norm_out = nn.LayerNorm(self.video_inner_dim, affine=False, eps=norm_eps)
+        self.proj_out = nn.Linear(self.video_inner_dim, out_channels)
+
+        # Cross-modal attention AdaLN (video side)
+        self.av_ca_video_scale_shift_adaln_single = AdaLayerNormSingle(
+            self.video_inner_dim, num_embeddings=4
+        )
+        self.av_ca_a2v_gate_adaln_single = AdaLayerNormSingle(
+            self.video_inner_dim, num_embeddings=1
+        )
+
+        # =================
+        # AUDIO COMPONENTS
+        # =================
+        # Input projection: audio latent -> audio inner_dim
+        self.audio_patchify_proj = nn.Linear(
+            self.AUDIO_IN_CHANNELS, self.audio_inner_dim, bias=True
+        )
+
+        # AdaLN for timestep conditioning
+        self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim)
+
+        # Caption projection for audio
+        self.audio_caption_projection = PixArtAlphaTextProjection(
+            in_features=caption_channels,
+            hidden_size=self.audio_inner_dim,
+        )
+
+        # Output projection
+        # Note: scale_shift_table kept as float32 for numerical stability, even in FP16 mode
+        self.audio_scale_shift_table = mx.zeros((2, self.audio_inner_dim), dtype=mx.float32)
+        self.audio_norm_out = nn.LayerNorm(self.audio_inner_dim, affine=False, eps=norm_eps)
+        self.audio_proj_out = nn.Linear(self.audio_inner_dim, self.AUDIO_OUT_CHANNELS)
+
+        # Cross-modal attention AdaLN (audio side)
+        self.av_ca_audio_scale_shift_adaln_single = AdaLayerNormSingle(
+            self.audio_inner_dim, num_embeddings=4
+        )
+        self.av_ca_v2a_gate_adaln_single = AdaLayerNormSingle(
+            self.audio_inner_dim, num_embeddings=1
+        )
+
+        # =================
+        # TRANSFORMER BLOCKS
+        # =================
+        video_config = TransformerConfig(
+            dim=self.video_inner_dim,
+            heads=num_attention_heads,
+            d_head=attention_head_dim,
+            context_dim=cross_attention_dim,
+        )
+        audio_config = TransformerConfig(
+            dim=self.audio_inner_dim,
+            heads=self.AUDIO_ATTENTION_HEADS,
+            d_head=self.AUDIO_HEAD_DIM,
+            context_dim=cross_attention_dim,  # Same text context
+        )
+
+        self.transformer_blocks = [
+            BasicAVTransformerBlock(
+                idx=i,
+                video_config=video_config,
+                audio_config=audio_config,
+                rope_type=rope_type,
+                norm_eps=norm_eps,
+            )
+            for i in range(num_layers)
+        ]
+
+        # =================
+        # PREPROCESSORS
+        # =================
+        # Video preprocessor
+        video_simple_preprocessor = TransformerArgsPreprocessor(
+            patchify_proj=self.patchify_proj,
+            adaln=self.adaln_single,
+            caption_projection=self.caption_projection,
+            inner_dim=self.video_inner_dim,
+            max_pos=self.positional_embedding_max_pos,
+            num_attention_heads=self.num_attention_heads,
+            use_middle_indices_grid=self.use_middle_indices_grid,
+            timestep_scale_multiplier=self.timestep_scale_multiplier,
+            positional_embedding_theta=self.positional_embedding_theta,
+            rope_type=self.rope_type,
+        )
+        self._video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
+            simple_preprocessor=video_simple_preprocessor,
+            cross_scale_shift_adaln=self.av_ca_video_scale_shift_adaln_single,
+            cross_gate_adaln=self.av_ca_a2v_gate_adaln_single,
+            cross_pe_max_pos=self.AUDIO_CROSS_PE_MAX_POS,
+            audio_cross_attention_dim=self.audio_inner_dim,
+            av_ca_timestep_scale_multiplier=av_ca_timestep_scale_multiplier,
+        )
+
+        # Audio preprocessor
+        audio_simple_preprocessor = TransformerArgsPreprocessor(
+            patchify_proj=self.audio_patchify_proj,
+            adaln=self.audio_adaln_single,
+            caption_projection=self.audio_caption_projection,
+            inner_dim=self.audio_inner_dim,
+            max_pos=[self.AUDIO_CROSS_PE_MAX_POS],  # 1D for audio
+            num_attention_heads=self.AUDIO_ATTENTION_HEADS,
+            use_middle_indices_grid=True,
+            timestep_scale_multiplier=self.timestep_scale_multiplier,
+            positional_embedding_theta=self.positional_embedding_theta,
+            rope_type=self.rope_type,
+        )
+        self._audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
+            simple_preprocessor=audio_simple_preprocessor,
+            cross_scale_shift_adaln=self.av_ca_audio_scale_shift_adaln_single,
+            cross_gate_adaln=self.av_ca_v2a_gate_adaln_single,
+            cross_pe_max_pos=self.AUDIO_CROSS_PE_MAX_POS,
+            audio_cross_attention_dim=self.audio_inner_dim,
+            av_ca_timestep_scale_multiplier=av_ca_timestep_scale_multiplier,
+        )
+
+    def _process_transformer_blocks(
+        self,
+        video_args: TransformerArgs,
+        audio_args: TransformerArgs,
+    ) -> Tuple[TransformerArgs, TransformerArgs]:
+        """
+        Process all transformer blocks for both video and audio.
+
+        Args:
+            video_args: Preprocessed video transformer arguments.
+            audio_args: Preprocessed audio transformer arguments.
+
+        Returns:
+            Tuple of (updated_video_args, updated_audio_args) after all blocks.
+        """
+        for i, block in enumerate(self.transformer_blocks):
+            video_args, audio_args = block(video_args, audio_args)
+            # Force evaluation periodically to release intermediate tensors
+            # low_memory mode: every 4 layers, normal: every 8 layers
+            if (i + 1) % self._eval_frequency == 0:
+                mx.eval(video_args.x)
+                mx.eval(audio_args.x)
+        return video_args, audio_args
+
+    def _process_video_output(
+        self,
+        x: mx.array,
+        embedded_timestep: mx.array,
+    ) -> mx.array:
+        """Process video output with final normalization and projection."""
+        scale_shift_values = (
+            self.scale_shift_table[None, None, :, :] + embedded_timestep[:, :, None, :]
+        )
+        shift = scale_shift_values[:, :, 0, :]
+        scale = scale_shift_values[:, :, 1, :]
+
+        x = self.norm_out(x)
+        x = x * (1 + scale) + shift
+        x = self.proj_out(x)
+        return x
+
+    def _process_audio_output(
+        self,
+        x: mx.array,
+        embedded_timestep: mx.array,
+    ) -> mx.array:
+        """Process audio output with final normalization and projection."""
+        scale_shift_values = (
+            self.audio_scale_shift_table[None, None, :, :] + embedded_timestep[:, :, None, :]
+        )
+        shift = scale_shift_values[:, :, 0, :]
+        scale = scale_shift_values[:, :, 1, :]
+
+        x = self.audio_norm_out(x)
+        x = x * (1 + scale) + shift
+        x = self.audio_proj_out(x)
+        return x
+
+    def __call__(
+        self,
+        video: Modality,
+        audio: Modality,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Forward pass for AudioVideo model.
+
+        Args:
+            video: Input video modality data.
+            audio: Input audio modality data.
+
+        Returns:
+            Tuple of (video_velocity, audio_velocity) predictions.
+        """
+        # Cast inputs to compute dtype for memory efficiency
+        if self.compute_dtype != mx.float32:
+            video = Modality(
+                latent=video.latent.astype(self.compute_dtype),
+                context=video.context.astype(self.compute_dtype),
+                context_mask=video.context_mask,
+                timesteps=video.timesteps,
+                positions=video.positions,
+                enabled=video.enabled,
+            )
+            audio = Modality(
+                latent=audio.latent.astype(self.compute_dtype),
+                context=audio.context.astype(self.compute_dtype),
+                context_mask=audio.context_mask,
+                timesteps=audio.timesteps,
+                positions=audio.positions,
+                enabled=audio.enabled,
+            )
+
+        # Preprocess inputs
+        video_args = self._video_args_preprocessor.prepare(video)
+
+        # Only preprocess audio if enabled and has tokens
+        # The transformer blocks check `audio.enabled and ax.size > 0` anyway,
+        # so we can skip preprocessing for disabled audio to avoid errors
+        if audio.enabled and audio.latent.size > 0:
+            audio_args = self._audio_args_preprocessor.prepare(audio)
+        else:
+            # Create minimal disabled TransformerArgs
+            audio_args = TransformerArgs(
+                x=mx.zeros((video_args.x.shape[0], 0, self.audio_inner_dim)),
+                context=mx.zeros((video_args.x.shape[0], 0, self.audio_inner_dim)),
+                timesteps=mx.zeros((video_args.x.shape[0], 0, 6, self.audio_inner_dim)),
+                positional_embeddings=(mx.zeros((1,)), mx.zeros((1,))),  # Minimal PE
+                enabled=False,
+            )
+
+        # Process through transformer blocks
+        video_args, audio_args = self._process_transformer_blocks(video_args, audio_args)
+
+        # Process outputs
+        video_output = self._process_video_output(video_args.x, video_args.embedded_timestep)
+
+        # Only process audio output if audio was enabled
+        if audio_args.enabled and audio_args.x.size > 0:
+            audio_output = self._process_audio_output(audio_args.x, audio_args.embedded_timestep)
+        else:
+            # Return empty audio output for disabled audio
+            audio_output = mx.zeros((video_args.x.shape[0], 0, self.AUDIO_OUT_CHANNELS))
+
+        # Cast outputs back to float32 for numerical stability
+        if self.compute_dtype != mx.float32:
+            video_output = video_output.astype(mx.float32)
+            audio_output = audio_output.astype(mx.float32)
+
+        return video_output, audio_output
+
+
+class X0AVModel(nn.Module):
+    """
+    Wrapper that returns denoised outputs instead of velocities for AudioVideo model.
+
+    Converts velocity predictions to denoised predictions using:
+    x0 = x - sigma * velocity
+    """
+
+    def __init__(self, velocity_model: LTXAVModel):
+        super().__init__()
+        self.velocity_model = velocity_model
+
+    def __call__(
+        self,
+        video: Modality,
+        audio: Modality,
+    ) -> Tuple[mx.array, mx.array]:
+        """
+        Compute denoised video and audio from noisy inputs.
+
+        Args:
+            video: Input video modality (noisy latent).
+            audio: Input audio modality (noisy latent).
+
+        Returns:
+            Tuple of (denoised_video, denoised_audio).
+        """
+        video_velocity, audio_velocity = self.velocity_model(video, audio)
+
+        # Convert velocity to denoised: x0 = x - sigma * v
+        video_timesteps = video.timesteps
+        if video_timesteps.ndim == 1:
+            video_timesteps = video_timesteps[:, None, None]
+        elif video_timesteps.ndim == 2:
+            video_timesteps = video_timesteps[:, :, None]
+
+        audio_timesteps = audio.timesteps
+        if audio_timesteps.ndim == 1:
+            audio_timesteps = audio_timesteps[:, None, None]
+        elif audio_timesteps.ndim == 2:
+            audio_timesteps = audio_timesteps[:, :, None]
+
+        denoised_video = video.latent - video_timesteps * video_velocity
+        denoised_audio = audio.latent - audio_timesteps * audio_velocity
+
+        return denoised_video, denoised_audio

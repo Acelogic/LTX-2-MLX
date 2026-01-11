@@ -13,6 +13,10 @@ class GuiderProtocol(Protocol):
         """Compute the guidance delta between conditioned and unconditioned samples."""
         ...
 
+    def guide(self, cond: mx.array, uncond: mx.array) -> mx.array:
+        """Apply guidance to get the final output: cond + delta(cond, uncond)."""
+        ...
+
     def enabled(self) -> bool:
         """Return True if guidance is active."""
         ...
@@ -35,6 +39,9 @@ class CFGGuider:
 
     def delta(self, cond: mx.array, uncond: mx.array) -> mx.array:
         return (self.scale - 1) * (cond - uncond)
+
+    def guide(self, cond: mx.array, uncond: mx.array) -> mx.array:
+        return cond + self.delta(cond, uncond)
 
     def enabled(self) -> bool:
         return self.scale != 1.0
@@ -62,6 +69,9 @@ class CFGStarRescalingGuider:
         rescaled_neg = projection_coef(cond, uncond) * uncond
         return (self.scale - 1) * (cond - rescaled_neg)
 
+    def guide(self, cond: mx.array, uncond: mx.array) -> mx.array:
+        return cond + self.delta(cond, uncond)
+
     def enabled(self) -> bool:
         return self.scale != 1.0
 
@@ -84,6 +94,9 @@ class STGGuider:
 
     def delta(self, pos_denoised: mx.array, perturbed_denoised: mx.array) -> mx.array:
         return self.scale * (pos_denoised - perturbed_denoised)
+
+    def guide(self, pos_denoised: mx.array, perturbed_denoised: mx.array) -> mx.array:
+        return pos_denoised + self.delta(pos_denoised, perturbed_denoised)
 
     def enabled(self) -> bool:
         return self.scale != 0.0
@@ -131,6 +144,9 @@ class LtxAPGGuider:
         g_apg = g_parallel * self.eta + g_orth
 
         return g_apg * (self.scale - 1)
+
+    def guide(self, cond: mx.array, uncond: mx.array) -> mx.array:
+        return cond + self.delta(cond, uncond)
 
     def enabled(self) -> bool:
         return self.scale != 1.0
@@ -181,6 +197,9 @@ class LegacyStatefulAPGGuider:
         g_apg = g_parallel * self.eta + g_orth
 
         return g_apg * self.scale
+
+    def guide(self, cond: mx.array, uncond: mx.array) -> mx.array:
+        return cond + self.delta(cond, uncond)
 
     def enabled(self) -> bool:
         return self.scale != 0.0

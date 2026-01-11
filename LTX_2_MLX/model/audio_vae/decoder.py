@@ -241,8 +241,10 @@ class AudioDecoder(nn.Module):
         h = nn.silu(h)
         h = self.conv_out(h)
 
-        # Adjust output shape to target
-        h = h[:, :self.out_ch, :target_frames, :f]
+        # Adjust output shape to target (frames are upsampled 4x, mel bins are upsampled 4x)
+        # Output shape: (B, out_ch, frames_upsampled, mel_bins_upsampled)
+        target_mel = f * LATENT_DOWNSAMPLE_FACTOR  # 16 * 4 = 64
+        h = h[:, :self.out_ch, :target_frames, :target_mel]
 
         # Cast back to float32
         if self.compute_dtype != mx.float32:
