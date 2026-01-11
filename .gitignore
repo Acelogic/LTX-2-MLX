@@ -53,7 +53,9 @@ weights/
 # Output files
 *.mp4
 *.npz
+*.png
 output/
+gens/
 
 # Logs
 *.log

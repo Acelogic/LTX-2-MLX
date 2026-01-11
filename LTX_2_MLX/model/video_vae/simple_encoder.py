@@ -5,7 +5,7 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .ops import patchify
+from .ops import patchify, PerChannelStatistics
 
 
 def _pixel_norm(x: mx.array, eps: float = 1e-6) -> mx.array:
@@ -284,8 +284,7 @@ class SimpleVideoEncoder(nn.Module):
         self.patch_size = 4
 
         # Per-channel statistics for normalization
-        self.mean_of_means = mx.zeros((128,), dtype=mx.float32)
-        self.std_of_means = mx.zeros((128,), dtype=mx.float32)
+        self.per_channel_statistics = PerChannelStatistics(latent_channels=128)
 
         # Conv in: 48 (patchified RGB) -> 128
         self.conv_in = Conv3dSimple(48, 128)
@@ -396,7 +395,7 @@ class SimpleVideoEncoder(nn.Module):
         means = x[:, :128, :, :, :]
 
         # Normalize using per-channel statistics
-        means = (means - self.mean_of_means[None, :, None, None, None]) / self.std_of_means[None, :, None, None, None]
+        means = self.per_channel_statistics.normalize(means)
 
         # Cast output back to float32
         if self.compute_dtype != mx.float32:
@@ -422,7 +421,7 @@ def load_vae_encoder_weights(encoder: SimpleVideoEncoder, weights_path: str) -> 
 
     with safe_open(weights_path, framework="pt") as f:
         # Load per-channel statistics
-        for stat_key in ["mean-of-means", "std-of-means"]:
+        for stat_key in ["mean-of-means", "std-of-means", "mean-of-stds", "mean-of-stds-over-std-of-means", "channel"]:
             pt_key = f"vae.per_channel_statistics.{stat_key}"
             if pt_key in f.keys():
                 tensor = f.get_tensor(pt_key)
@@ -430,10 +429,9 @@ def load_vae_encoder_weights(encoder: SimpleVideoEncoder, weights_path: str) -> 
                     tensor = tensor.to(torch.float32)
                 value = mx.array(tensor.numpy())
 
-                if stat_key == "mean-of-means":
-                    encoder.mean_of_means = value
-                else:
-                    encoder.std_of_means = value
+                # Convert hyphenated names to underscored attribute names
+                attr_name = stat_key.replace("-", "_")
+                setattr(encoder.per_channel_statistics, attr_name, value)
                 loaded_count += 1
 
         # Load conv_in

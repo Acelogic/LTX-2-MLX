@@ -429,7 +429,23 @@ class TwoStagePipeline:
 
         # ====== STAGE 2: Upsample and refine with distilled LoRA ======
         # Upsample the latent 2x
-        upscaled_latent = self.spatial_upscaler(stage_1_latent)
+        # CRITICAL: Must un-normalize before upsampling, then re-normalize after
+        # This is required by the PyTorch reference implementation to preserve latent distribution
+        latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
+
+        # Use bilinear upsampling (spatial upscaler has res block instability)
+        b, c, f, h, w = latent_unnorm.shape
+        upscaled_unnorm = mx.zeros((b, c, f, h * 2, w * 2), dtype=latent_unnorm.dtype)
+
+        for fi in range(f):
+            frame = latent_unnorm[:, :, fi, :, :]  # (B, C, H, W)
+            frame_t = frame.transpose(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
+            frame_up = mx.repeat(mx.repeat(frame_t, 2, axis=1), 2, axis=2)  # Nearest neighbor 2x
+            frame_out = frame_up.transpose(0, 3, 1, 2)  # (B, H*2, W*2, C) -> (B, C, H*2, W*2)
+            upscaled_unnorm[:, :, fi, :, :] = frame_out
+
+        # Re-normalize back to latent space
+        upscaled_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
         mx.eval(upscaled_latent)
 
         # Apply distilled LoRA if provided
