@@ -13,6 +13,12 @@ import mlx.core as mx
 import numpy as np
 from PIL import Image
 
+from .common import (
+    apply_conditionings,
+    modality_from_state,
+    post_process_latent,
+    timesteps_from_mask,
+)
 from ..components import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     CFGGuider,
@@ -161,51 +167,6 @@ def create_keyframe_conditionings(
         conditionings.append(conditioning)
 
     return conditionings
-
-
-def apply_conditionings(
-    latent_state: LatentState,
-    conditionings: List[ConditioningItem],
-    video_tools: VideoLatentTools,
-) -> LatentState:
-    """Apply all conditionings to the latent state."""
-    for conditioning in conditionings:
-        latent_state = conditioning.apply_to(latent_state, video_tools)
-    return latent_state
-
-
-def post_process_latent(
-    denoised: mx.array,
-    denoise_mask: mx.array,
-    clean_latent: mx.array,
-) -> mx.array:
-    """Blend denoised output with clean state based on mask."""
-    return (denoised * denoise_mask + clean_latent * (1 - denoise_mask)).astype(
-        denoised.dtype
-    )
-
-
-def timesteps_from_mask(denoise_mask: mx.array, sigma: float) -> mx.array:
-    """Compute timesteps from denoise mask and sigma."""
-    return denoise_mask * sigma
-
-
-def modality_from_state(
-    state: LatentState,
-    context: mx.array,
-    context_mask: mx.array,
-    sigma: float,
-    enabled: bool = True,
-) -> Modality:
-    """Create a Modality from a latent state."""
-    return Modality(
-        enabled=enabled,
-        latent=state.latent,
-        timesteps=timesteps_from_mask(state.denoise_mask, sigma),
-        positions=state.positions,
-        context=context,
-        context_mask=context_mask,
-    )
 
 
 class KeyframeInterpolationPipeline:

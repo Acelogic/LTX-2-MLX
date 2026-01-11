@@ -66,5 +66,12 @@ tmp/
 temp/
 *.tmp
 
+# Test outputs
+tests/outputs/
+tests/fixtures/
+
 # LTX-2 submodule (if cloned separately)
 LTX-2/
+
+# OBJECTIVE.md (generated during debugging)
+OBJECTIVE.md

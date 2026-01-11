@@ -79,6 +79,15 @@ class VideoConditionByLatentIndex:
         start_token = latent_tools.patchifier.get_token_count(start_shape)
         stop_token = start_token + tokens.shape[1]
 
+        # Validate bounds
+        max_tokens = latent_tools.patchifier.get_token_count(tgt_shape)
+        if stop_token > max_tokens:
+            raise ValueError(
+                f"Conditioning tokens exceed latent sequence length: "
+                f"stop_token={stop_token} > max_tokens={max_tokens}. "
+                f"latent_idx={self.latent_idx}, tokens.shape={tokens.shape}"
+            )
+
         # Create new arrays with conditioning applied
         # Replace latent tokens
         latent_before = latent_state.latent[:, :start_token]
