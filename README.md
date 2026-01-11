@@ -180,7 +180,10 @@ python scripts/generate.py "A cat walking" \
     --height 512 --width 704 \
     --cfg 5.0 --steps-stage1 15 \
     --spatial-upscaler-weights weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors \
+    --distilled-lora weights/ltx-2/ltx-2-19b-distilled-lora-384.safetensors \
     --fp16
+```
+> **Note**: Resolution is automatically adjusted to be divisible by 64 (required for the two-stage pipeline).
 ```
 
 - **Stage 1**: Generate at half resolution (256x352) with CFG
@@ -258,7 +261,8 @@ video = pipeline(keyframes=keyframes, ...)
 
 **High Resolution (3-4 min)**
 ```bash
---pipeline two-stage --height 768 --width 1024 --frames 25 --steps-stage1 15 --cfg 5.0 --fp16
+
+--pipeline two-stage --height 768 --width 1024 --frames 25 --steps-stage1 15 --distilled-lora weights/ltx-2/ltx-2-19b-distilled-lora-384.safetensors --fp16
 ```
 
 ### Options
@@ -399,7 +403,8 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 ### Working ✅
 - **Text-to-video generation producing semantic content** (palm trees, sunsets, grass, etc.)
 - **6 specialized pipelines**: text-to-video, distilled, one-stage, two-stage, ic-lora, keyframe-interpolation
-- **Two-stage pipeline with spatial upscaling** (512x704+, quality verified)
+- **Two-stage pipeline with spatial upscaling** (512x704+, verified high quality with Distilled LoRA)
+- **Distilled LoRA Support** (for refining details in Stage 2)
 - Full text encoding pipeline (all 49 Gemma layers + normalization + projection)
 - Native MLX Gemma 3 12B text encoder (FP16)
 - 48-layer transformer (19B parameters) verified to match PyTorch exactly (correlation = 1.0)
@@ -419,7 +424,7 @@ Accept the Gemma license at: https://huggingface.co/google/gemma-3-12b-it
 ### Pending 📋
 - Image-to-video conditioning via IC-LoRA (code exists, needs CLI integration)
 - Keyframe interpolation (code exists, needs testing)
-- LoRA support (infrastructure exists, needs weights and testing)
+- Generic LoRA support (infrastructure exists, standard LoRAs in testing)
 
 ## Known Limitations
 

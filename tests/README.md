@@ -24,6 +24,11 @@ These tests validate individual components without requiring model weights:
   - Full SpatialUpscaler and TemporalUpscaler pipelines
   - Numerical stability verification (prevents res-block explosion)
 
+- **test_parity_structure.py** (5 tests) - Parity verification with PyTorch reference
+  - LTXModel structural correctness (RoPE type, merged classes)
+  - BasicAVTransformerBlock features (Cross-Attention scale)
+  - Component initialization checks (verified against LTX-2 Technical Report)
+
 **Total unit tests: 60**
 **Execution time: ~2 seconds**
 
@@ -35,7 +40,22 @@ These tests validate end-to-end video generation pipelines:
   - Text-to-video generation
   - Image-to-video generation
   - Two-stage pipeline with spatial upscaling
+  - Two-stage pipeline with spatial upscaling
   - FP8 quantized model testing
+
+### Manual Verification (Placeholder Mode)
+
+For quick verification without loading weights (works on low-RAM machines):
+
+```bash
+# Verify Two-Stage Pipeline Logic
+python scripts/generate.py "test" \
+  --pipeline two-stage \
+  --placeholder \
+  --distilled-lora weights/dummy.safetensors \
+  --height 512 --width 768 \
+  --no-gemma
+```
 
 ## Running Tests
 
@@ -138,7 +158,8 @@ Current test coverage by component:
 | Conditioning Logic | 15 | ✅ Complete |
 | Upscalers (Spatial/Temporal) | 23 | ✅ Complete |
 | VAE Encoder/Decoder | 0 | ⏳ Pending |
-| Transformer Blocks | 0 | ⏳ Pending |
+| VAE Encoder/Decoder | 0 | ⏳ Pending |
+| Transformer Blocks | 5 | ✅ Complete (Parity Checked) |
 | Text Encoder | 0 | ⏳ Pending |
 | Full Pipelines | 0 | ⏳ Pending |
 
