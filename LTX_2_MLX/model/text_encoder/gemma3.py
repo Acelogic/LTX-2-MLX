@@ -278,6 +278,9 @@ class Gemma3Model(nn.Module):
         # Token embeddings
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
 
+        # Embedding scale factor (Gemma multiplies embeddings by sqrt(hidden_size))
+        self.embed_scale = config.hidden_size ** 0.5
+
         # Transformer layers
         self.layers = [Gemma3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
 
@@ -306,11 +309,11 @@ class Gemma3Model(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
-        # Get embeddings
-        hidden_states = self.embed_tokens(input_ids)
+        # Get embeddings and scale by sqrt(hidden_size)
+        hidden_states = self.embed_tokens(input_ids) * self.embed_scale
 
-        # Collect hidden states (including embedding layer)
-        all_hidden_states = [hidden_states] if output_hidden_states else None
+        # Collect hidden states (PyTorch adds hidden states at START of each layer iteration)
+        all_hidden_states = [] if output_hidden_states else None
 
         # Create causal mask if needed
         if attention_mask is not None:
@@ -337,13 +340,18 @@ class Gemma3Model(nn.Module):
             layer_iter = self.layers
 
         for layer in layer_iter:
-            hidden_states = layer(hidden_states, attention_mask, position_ids)
-            mx.eval(hidden_states)  # Force eval for progress tracking
+            # Add hidden states BEFORE each layer (matching PyTorch behavior)
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
+            hidden_states = layer(hidden_states, attention_mask, position_ids)
+            mx.eval(hidden_states)  # Force eval for progress tracking
 
         # Final norm
         hidden_states = self.norm(hidden_states)
+
+        # Add normalized final hidden state (matching PyTorch behavior)
+        if output_hidden_states:
+            all_hidden_states.append(hidden_states)
 
         return hidden_states, all_hidden_states
 

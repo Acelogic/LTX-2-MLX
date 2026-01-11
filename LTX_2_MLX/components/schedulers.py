@@ -232,14 +232,16 @@ def flux_time_shift(mu: float, sigma: float, t: float) -> float:
 
 
 # Predefined sigma values for distilled models
+# Official distilled sigma schedule from LTX-2 ComfyUI (9 values for 8 steps)
 DISTILLED_SIGMA_VALUES = [
     1.0,
-    0.7015051841735842,
-    0.4324620887498063,
-    0.22555572818498475,
-    0.09525429829654909,
-    0.02813717286656342,
-    0.0029733014966071504,
+    0.99375,
+    0.9875,
+    0.98125,
+    0.975,
+    0.909375,
+    0.725,
+    0.421875,
     0.0,
 ]
 

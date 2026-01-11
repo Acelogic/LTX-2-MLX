@@ -2,7 +2,7 @@
 
 ## Overview
 
-This document outlines the key differences between PyTorch and MLX that were critical for achieving inference parity in the RVC port.
+This document outlines the key differences between PyTorch and MLX that were critical for achieving inference parity in the LTX-2 video generation port.
 
 ## 1. Tensor Dimension Ordering
 
@@ -53,7 +53,7 @@ This document outlines the key differences between PyTorch and MLX that were cri
 
 ### LayerNorm Parameters
 **PyTorch (newer):** `.weight` and `.bias`
-**PyTorch (older/custom):** `.gamma` and `.beta` (Often used in RVC)
+**PyTorch (older/custom):** `.gamma` and `.beta`
 **MLX:** `.weight` and `.bias`
 
 **Conversion:** 
@@ -312,40 +312,40 @@ x = x.half()
 x = x.astype(mx.float16)
 ```
 
-## 16. ResidualCouplingBlock Structure / Flow Layers
-316: 
-317: ### PyTorch
-318: The `ResidualCouplingBlock` typically contains a `ModuleList` of flows. Critically, some implementations interleave `Flip()` modules (which have no weights) with `ResidualCouplingLayer` modules.
-319: 
-320: ```python
-321: self.flows = nn.ModuleList()
-322: for _ in range(n_flows):
-323:     self.flows.append(ResidualCouplingLayer(...)) # Index 0, 2, 4...
-324:     self.flows.append(Flip())                     # Index 1, 3, 5...
-325: ```
-326: 
-327: ### MLX
-328: We typically implement only the `ResidualCouplingLayer`s in a list, or handle Flip implicitly.
-329: 
-330: ```python
-331: self.flows = [ResidualCouplingLayer(...) for _ in range(n_flows)]
-332: ```
-333: 
-334: **Conversion Trap:**
-335: If you blindly map `flow.flows.0` -> `flow_0`, `flow.flows.2` -> `flow_2`, you will skip indices 0, 1, 2... in your MLX list if it's dense.
-336: 
-337: **Correct Logic:**
-338: ```python
-339: # PyTorch Index: 0 (Layer), 1 (Flip), 2 (Layer), 3 (Flip)
-340: # MLX Index:     0 (Layer),            1 (Layer)
-341: 
-342: if key.startswith("flow.flows."):
-343:     pt_idx = int(key.split(".")[2])
-344:     mlx_idx = pt_idx // 2  # Skip Flip
-345:     new_key = f"flow.flow_{mlx_idx}..."
-346: ```
-347: 
-348: ## Summary Table
+## 16. Interleaved ModuleList Structures
+
+### PyTorch
+Some architectures use `ModuleList` with interleaved module types - for example, alternating between processing layers and utility modules (like flip/permute operations):
+
+```python
+self.layers = nn.ModuleList()
+for _ in range(n_layers):
+    self.layers.append(ProcessingLayer(...))  # Index 0, 2, 4...
+    self.layers.append(UtilityModule())       # Index 1, 3, 5...
+```
+
+### MLX
+When the utility modules have no weights (e.g., simple permutations), we typically implement only the processing layers and handle utilities implicitly:
+
+```python
+self.layers = [ProcessingLayer(...) for _ in range(n_layers)]
+```
+
+**Conversion Trap:**
+If you blindly map `block.layers.0` -> `layer_0`, `block.layers.2` -> `layer_2`, you will skip indices in your MLX list if it's dense.
+
+**Correct Logic:**
+```python
+# PyTorch Index: 0 (Layer), 1 (Utility), 2 (Layer), 3 (Utility)
+# MLX Index:     0 (Layer),             1 (Layer)
+
+if key.startswith("block.layers."):
+    pt_idx = int(key.split(".")[2])
+    mlx_idx = pt_idx // 2  # Skip utility modules
+    new_key = f"block.layer_{mlx_idx}..."
+```
+
+## Summary Table
 
 | Feature | PyTorch | MLX |
 |---------|---------|-----|
@@ -359,7 +359,7 @@ x = x.astype(mx.float16)
 | Gradient mode | `torch.no_grad()` | No gradients by default |
 | Weight norm | Built-in | Must fuse manually |
 | Module loading | `load_state_dict()` | `load_weights()` |
-| Flow Indices | `0, 1, 2, 3` (Layer, Flip...) | `0, 1` (Layer, Layer...) |
+| Interleaved ModuleList | Indices 0,1,2,3... | Dense indices (skip weightless) |
 
 ## Best Practices for Porting
 
@@ -501,13 +501,65 @@ def load_gemma3_weights(model, weights_dir, use_fp16=True):
     value = mx.array(tensor.numpy()).astype(target_dtype)
 ```
 
+### 7. Velocity vs Denoised Prediction Handling
+
+**PyTorch (LTX-2):**
+```python
+# PyTorch pipelines handle velocity-to-denoised conversion internally
+# or use explicit X0 prediction models
+output = model(noisy_latent, timestep)  # Returns velocity
+denoised = noisy_latent - sigma * output  # Conversion done in pipeline
+```
+
+**MLX (Required):**
+```python
+# Must wrap velocity model with X0Model for correct denoising
+from LTX_2_MLX.model.transformer import X0Model
+
+velocity_model = load_transformer(weights_path, ...)
+model = X0Model(velocity_model)  # Now returns denoised directly
+
+# X0Model performs: denoised = latent - sigma * velocity
+```
+
+**Impact:** Without X0Model wrapping, the Euler diffusion step receives velocity instead of denoised predictions, causing denoising to fail and producing noise/static output.
+
+**Symptoms of missing X0Model:**
+- Video output is noise/static (not black)
+- Latent std ~0.59 instead of ~1.27
+- Video range is narrow (e.g., 101-208 instead of 60-251)
+
+### 8. Text Encoding Feature Extraction
+
+**PyTorch:**
+```python
+# Uses all 49 Gemma hidden states with normalization and projection
+hidden_states = gemma(input_ids).hidden_states  # 49 layers
+stacked = torch.stack(hidden_states, dim=-1)    # [B, T, 3840, 49]
+normed = norm_and_concat_padded_batch(stacked)  # Normalize per layer
+features = aggregate_embed(normed)              # Linear projection → [B, T, 3840]
+```
+
+**MLX (Must Match):**
+```python
+# CRITICAL: Must use all 49 layers, NOT just the final layer
+stacked = mx.stack(hidden_states, axis=-1)      # [B, T, 3840, 49]
+normed = norm_and_concat_padded_batch(stacked, sequence_lengths, padding_side)
+features = self.aggregate_embed(normed)         # [B, T, 3840]
+```
+
+**Impact:** Using only Layer 48 produces embeddings the model wasn't trained with, resulting in noise output instead of semantic content.
+
 ### LTX-2 Pipeline Comparison Summary
 
 | Aspect | PyTorch LTX-2 | MLX LTX-2 |
 |--------|--------------|-----------|
 | Text Encoder | Gemma 3 12B (FP32) | Gemma 3 12B (FP16) |
+| Feature Extraction | All 49 layers + norm + projection | Same (CRITICAL) |
 | Padding | LEFT | RIGHT (required) |
 | Denoising Steps | 30 (dynamic) | 7 (distilled) |
 | Conv3d | Native | Iterated Conv2d |
 | VAE Output | Direct | +0.31 bias correction |
 | Memory (Gemma) | ~24GB | ~12GB |
+| Transformer Output | Velocity | X0Model wrapper required |
+| RoPE Type | SPLIT | SPLIT (was INTERLEAVED - fixed) |

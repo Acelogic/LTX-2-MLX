@@ -10,7 +10,7 @@ from .types import (
     SpatioTemporalScaleFactors,
     VIDEO_SCALE_FACTORS,
 )
-from .utils import rms_norm, to_velocity, to_denoised
+from .core_utils import rms_norm, to_velocity, to_denoised
 
 __all__ = [
     # Types

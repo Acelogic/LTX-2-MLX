@@ -96,7 +96,11 @@ class VideoGemmaTextEncoderModel(nn.Module):
         """
         # (mask - 1) makes 1 -> 0, 0 -> -1
         # Multiply by large value to get 0 or -large_value
-        large_value = 1e9
+        # Use dtype-appropriate value to avoid overflow in FP16 (max 65504)
+        if dtype == mx.float16:
+            large_value = 65000.0  # Safe value for FP16
+        else:
+            large_value = 1e9
         additive_mask = (attention_mask.astype(dtype) - 1) * large_value
         # Reshape for attention: [B, 1, 1, T]
         additive_mask = additive_mask.reshape(

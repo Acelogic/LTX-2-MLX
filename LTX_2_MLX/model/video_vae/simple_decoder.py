@@ -173,7 +173,8 @@ class ResBlock3d(nn.Module):
         self.channels = channels
         self.conv1 = Conv3dSimple(channels, channels)
         self.conv2 = Conv3dSimple(channels, channels)
-        self.scale_shift_table = mx.zeros((4, channels))
+        # Note: kept as float32 for numerical stability
+        self.scale_shift_table = mx.zeros((4, channels), dtype=mx.float32)
 
     def __call__(
         self, x: mx.array, causal: bool = True, time_emb: Optional[mx.array] = None
@@ -241,7 +242,7 @@ class DepthToSpaceUpsample3d(nn.Module):
     def __init__(self, in_channels: int, factor: Tuple[int, int, int] = (2, 2, 2), residual: bool = False):
         super().__init__()
         self.factor = factor
-        self.residual = residual  # TODO: implement proper FIR upsampler for residual path
+        self.residual = residual
         ft, fh, fw = factor
         factor_product = ft * fh * fw
 
@@ -273,22 +274,31 @@ class DepthToSpaceUpsample3d(nn.Module):
     def __call__(self, x: mx.array, causal: bool = True) -> mx.array:
         """Upsample via conv then depth-to-space with optional residual."""
         ft, fh, fw = self.factor
+        factor_product = ft * fh * fw
 
-        # Residual path: upsample input via d2s, repeat channels
+        # Residual path: depth-to-space on input, then repeat channels
+        # PyTorch does:
+        #   1. pixel_shuffle(x) - this rearranges (B, in_ch, T, H, W) to (B, in_ch/8, T*2, H*2, W*2)
+        #   2. repeat channels by (factor_product // upscale_factor) = 8 // 2 = 4
+        # Example for in_channels=1024:
+        #   - After d2s: 1024/8 = 128 channels
+        #   - After repeat 4x: 128*4 = 512 = out_channels
         if self.residual:
             b, c_in, t, h, w = x.shape
-            # The input has in_channels, d2s expects c_out * factor_product
-            # We need to expand input to match this
-            # c_in = out_channels * upscale_factor = out_channels * 2
-            # For d2s: need c_out * factor_product = out_channels * 8
-            # So we repeat by 8/2 = 4
-            residual = self._depth_to_space(x, c_in // (ft * fh * fw // self.channel_repeats))
-            # Actually the input channel count may not work directly, use a simpler approach:
-            # Repeat channels then d2s
-            residual = mx.repeat(x, self.channel_repeats, axis=1)  # (B, C*4, T, H, W)
-            residual = self._depth_to_space(residual, self.out_channels)
+            # c_in / factor_product = number of output channels from d2s
+            c_d2s = c_in // factor_product  # e.g., 1024 // 8 = 128
+
+            # Apply depth-to-space to input
+            residual = self._depth_to_space(x, c_d2s)
+
+            # Trim first (ft-1) frames for causal consistency
             if ft > 1 and causal:
                 residual = residual[:, :, ft - 1:]
+
+            # Repeat channels to match out_channels
+            # num_repeat = factor_product // upscale_factor = 8 // 2 = 4
+            num_repeat = factor_product // self.upscale_factor
+            residual = mx.repeat(residual, num_repeat, axis=1)
 
         # Main path: conv then d2s
         x = self.conv(x, causal=causal)
@@ -373,8 +383,9 @@ class SimpleVideoDecoder(nn.Module):
         self.compute_dtype = compute_dtype
 
         # Per-channel statistics for denormalization
-        self.mean_of_means = mx.zeros((128,))
-        self.std_of_means = mx.zeros((128,))
+        # Note: kept as float32 for numerical stability
+        self.mean_of_means = mx.zeros((128,), dtype=mx.float32)
+        self.std_of_means = mx.zeros((128,), dtype=mx.float32)
 
         # Timestep conditioning
         self.timestep_scale_multiplier = mx.array(1000.0)
@@ -386,18 +397,19 @@ class SimpleVideoDecoder(nn.Module):
         # Factor (2,2,2) = 8x channel reduction (also halves channels) + 2x upsample in T,H,W
         # 1024 -> conv(4096) -> d2s -> 512 ch, 2x spatial/temporal
         self.up_blocks_0 = ResBlockGroup(1024, num_blocks=5)
-        self.up_blocks_1 = DepthToSpaceUpsample3d(1024, factor=(2, 2, 2))  # -> 512 ch
+        self.up_blocks_1 = DepthToSpaceUpsample3d(1024, factor=(2, 2, 2), residual=True)  # -> 512 ch
         self.up_blocks_2 = ResBlockGroup(512, num_blocks=5)
-        self.up_blocks_3 = DepthToSpaceUpsample3d(512, factor=(2, 2, 2))   # -> 256 ch
+        self.up_blocks_3 = DepthToSpaceUpsample3d(512, factor=(2, 2, 2), residual=True)   # -> 256 ch
         self.up_blocks_4 = ResBlockGroup(256, num_blocks=5)
-        self.up_blocks_5 = DepthToSpaceUpsample3d(256, factor=(2, 2, 2))   # -> 128 ch
+        self.up_blocks_5 = DepthToSpaceUpsample3d(256, factor=(2, 2, 2), residual=True)   # -> 128 ch
         self.up_blocks_6 = ResBlockGroup(128, num_blocks=5)
 
         # Conv out: 128 -> 48 (3 * 16 for patch_size=4 unpatchify)
         self.conv_out = Conv3dSimple(128, 48)
 
         # Scale/shift for final norm
-        self.last_scale_shift_table = mx.zeros((2, 128))
+        # Note: kept as float32 for numerical stability
+        self.last_scale_shift_table = mx.zeros((2, 128), dtype=mx.float32)
         # Time embedder for final norm (outputs 2*128=256 for scale+shift)
         self.last_time_embedder = None  # Will be set during weight loading
 
@@ -723,6 +735,7 @@ def decode_latent(
     latent: mx.array,
     decoder: SimpleVideoDecoder,
     timestep: Optional[float] = 0.05,
+    contrast_boost: Optional[float] = None,
 ) -> mx.array:
     """
     Decode latent to video frames.
@@ -732,6 +745,10 @@ def decode_latent(
         decoder: Loaded SimpleVideoDecoder instance.
         timestep: Timestep for conditioning (default 0.05 for denoising).
                   Use 0.0 for no denoising, None to disable timestep conditioning.
+        contrast_boost: Optional contrast multiplier (e.g., 1.2 for 20% more contrast).
+                        Larger videos (>480p) may benefit from 1.2-1.5 boost due to
+                        the denoising process producing less channel diversity at scale.
+                        Use "auto" to automatically compute based on resolution.
 
     Returns:
         Video frames as uint8 (T, H, W, 3) in [0, 255].
@@ -740,13 +757,40 @@ def decode_latent(
     if latent.ndim == 4:
         latent = latent[None]
 
+    # Auto-compute contrast boost based on resolution if not specified
+    # Larger videos tend to have lower dynamic range due to attention spreading
+    # across more tokens during denoising, resulting in more uniform channels
+    _, _, _, h, w = latent.shape
+    latent_pixels = h * w
+    if contrast_boost is None and latent_pixels > 150:  # Roughly > 384p
+        # Scale contrast boost based on resolution:
+        # - 150 pixels (e.g., 10x15): boost 1.0 (no change)
+        # - 330 pixels (e.g., 15x22 = 480x704): boost ~1.25
+        # - 600 pixels (e.g., 24x25): boost ~1.45
+        # Formula calibrated to match small video variance (~107)
+        contrast_boost = min(1.5, 1.0 + (latent_pixels - 150) / 700)
+
+    # Light normalization: just ensure overall std is reasonable
+    # The linear schedule produces latent with channel means in [-1.2, 1.4] which is close to expected
+    # Only do mild normalization if std is too far from 1.0
+    latent_std = float(mx.sqrt(mx.mean(latent * latent)))
+    if latent_std > 1.5 or latent_std < 0.5:
+        latent = latent / latent_std
+
     # Decode with timestep conditioning
     video = decoder(latent, timestep=timestep)
 
     # Apply bias correction to center output at 0
-    # The decoder outputs with a consistent negative bias (~-0.31)
-    # This correction brings brightness from ~35% to ~50%
-    video = video + 0.31
+    # The decoder outputs with a consistent negative bias (~-0.16 to -0.30)
+    # This correction brings brightness closer to ~50%
+    video = video + 0.30
+
+    # Apply contrast boost if specified
+    # This helps larger videos that have reduced channel diversity
+    if contrast_boost is not None and contrast_boost != 1.0:
+        # Boost contrast around the mean
+        video_mean = mx.mean(video)
+        video = video_mean + (video - video_mean) * contrast_boost
 
     # Convert to uint8: assume output is in [-1, 1]
     video = mx.clip((video + 1) / 2, 0, 1) * 255

@@ -23,6 +23,14 @@ from .patchifiers import (
     AudioPatchifier,
     get_pixel_coords,
 )
+from .perturbations import (
+    PerturbationType,
+    Perturbation,
+    PerturbationConfig,
+    BatchedPerturbationConfig,
+    create_stg_perturbation,
+    create_batched_stg_config,
+)
 
 __all__ = [
     # Schedulers
@@ -49,4 +57,11 @@ __all__ = [
     "VideoLatentPatchifier",
     "AudioPatchifier",
     "get_pixel_coords",
+    # Perturbations
+    "PerturbationType",
+    "Perturbation",
+    "PerturbationConfig",
+    "BatchedPerturbationConfig",
+    "create_stg_perturbation",
+    "create_batched_stg_config",
 ]
