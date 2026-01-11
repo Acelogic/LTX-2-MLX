@@ -91,7 +91,7 @@ class TextToVideoPipeline:
         self.decoder = decoder
         self.patchifier = patchifier
         self.noiser = noiser or GaussianNoiser()
-        self.guider = guider or CFGGuider(cfg_scale=7.5)
+        self.guider = guider or CFGGuider(scale=7.5)
         self.diffusion_step = diffusion_step or EulerDiffusionStep()
 
     def get_latent_shape(self, config: GenerationConfig) -> VideoLatentShape:
@@ -117,7 +117,7 @@ class TextToVideoPipeline:
         latent_frames = (config.num_frames - 1) // temporal_factor + 1
 
         return VideoLatentShape(
-            batch_size=1,
+            batch=1,
             channels=128,  # LTX latent channels
             frames=latent_frames,
             height=latent_height,
@@ -143,7 +143,7 @@ class TextToVideoPipeline:
             mx.random.seed(seed)
 
         return mx.random.normal(shape=(
-            shape.batch_size,
+            shape.batch,
             shape.channels,
             shape.frames,
             shape.height,
@@ -347,6 +347,6 @@ def create_pipeline(
         decoder=decoder,
         patchifier=VideoLatentPatchifier(),
         noiser=GaussianNoiser(),
-        guider=CFGGuider(cfg_scale=cfg_scale),
+        guider=CFGGuider(scale=cfg_scale),
         diffusion_step=EulerDiffusionStep(),
     )

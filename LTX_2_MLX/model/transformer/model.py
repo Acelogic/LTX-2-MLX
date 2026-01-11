@@ -12,6 +12,8 @@ from .timestep_embedding import AdaLayerNormSingle
 from .transformer import BasicTransformerBlock, BasicAVTransformerBlock, TransformerArgs, TransformerConfig
 
 
+
+
 class LTXModelType(Enum):
     """Model type variants."""
 
@@ -407,6 +409,7 @@ class LTXModel(nn.Module):
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         compute_dtype: mx.Dtype = mx.float32,
         low_memory: bool = False,
+        fast_mode: bool = False,
         cross_attn_scale_late: float = 1.0,
         cross_attn_scale_start_layer: int = 40,
     ):
@@ -430,6 +433,8 @@ class LTXModel(nn.Module):
             rope_type: Type of RoPE (SPLIT).
             compute_dtype: Dtype for computation (float32 or float16).
             low_memory: If True, use aggressive memory optimization (eval every 4 layers).
+            fast_mode: If True, skip intermediate evals for faster inference (uses more memory).
+                This allows MLX's lazy evaluation to batch more operations together.
             cross_attn_scale_late: Cross-attention scaling for late layers.
                 Higher values (5-10) increase text conditioning influence and
                 preserve semantic differentiation in late transformer layers.
@@ -450,8 +455,15 @@ class LTXModel(nn.Module):
         self.norm_eps = norm_eps
         self.compute_dtype = compute_dtype
         self.low_memory = low_memory
-        # Eval frequency: every 4 layers for low_memory, every 8 otherwise
-        self._eval_frequency = 4 if low_memory else 8
+        self.fast_mode = fast_mode
+        # Eval frequency: 0 for fast_mode (no intermediate evals),
+        # 4 for low_memory, 8 otherwise
+        if fast_mode:
+            self._eval_frequency = 0  # Skip all intermediate evals
+        elif low_memory:
+            self._eval_frequency = 4
+        else:
+            self._eval_frequency = 8
 
         if positional_embedding_max_pos is None:
             positional_embedding_max_pos = [20, 2048, 2048]
@@ -543,8 +555,9 @@ class LTXModel(nn.Module):
             args = block(args)
             # Force evaluation periodically to release intermediate tensors
             # This reduces peak memory by preventing lazy evaluation buildup
+            # fast_mode: no intermediate evals (faster but more memory)
             # low_memory mode: every 4 layers, normal: every 8 layers
-            if (i + 1) % self._eval_frequency == 0:
+            if self._eval_frequency > 0 and (i + 1) % self._eval_frequency == 0:
                 mx.eval(args.x)
         return args
 

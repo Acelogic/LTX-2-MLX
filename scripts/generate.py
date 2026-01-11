@@ -39,6 +39,52 @@ from LTX_2_MLX.model.video_vae.simple_decoder import (
     decode_latent,
 )
 from LTX_2_MLX.core_utils import to_velocity
+
+
+def batched_cfg_forward(
+    model,
+    latent_patchified: mx.array,
+    text_encoding: mx.array,
+    text_mask: mx.array,
+    null_encoding: mx.array,
+    null_mask: mx.array,
+    sigma: float,
+    positions: mx.array,
+) -> tuple:
+    """
+    Run CFG forward pass with batched inputs (2x speedup).
+
+    Instead of two separate forward passes for cond and uncond,
+    we stack them along the batch dimension and do a single pass.
+
+    Returns:
+        Tuple of (cond_output, uncond_output) both shape [1, T, C]
+    """
+    # Stack along batch dimension: [1, T, C] -> [2, T, C]
+    batched_latent = mx.concatenate([latent_patchified, latent_patchified], axis=0)
+    batched_context = mx.concatenate([text_encoding, null_encoding], axis=0)
+    batched_mask = mx.concatenate([text_mask, null_mask], axis=0)
+    batched_positions = mx.concatenate([positions, positions], axis=0)
+    batched_timesteps = mx.array([sigma, sigma])
+
+    # Single batched modality
+    batched_modality = Modality(
+        latent=batched_latent,
+        context=batched_context,
+        context_mask=batched_mask,
+        timesteps=batched_timesteps,
+        positions=batched_positions,
+        enabled=True,
+    )
+
+    # Single forward pass (2x faster than two separate passes)
+    batched_output = model(batched_modality)
+
+    # Split back: [2, T, C] -> two [1, T, C]
+    cond_output = batched_output[0:1]
+    uncond_output = batched_output[1:2]
+
+    return cond_output, uncond_output
 from LTX_2_MLX.model.text_encoder.gemma3 import (
     Gemma3Config,
     Gemma3Model,
@@ -496,12 +542,23 @@ def load_transformer(
     compute_dtype: mx.Dtype = mx.float32,
     use_fp8: bool = False,
     low_memory: bool = False,
+    fast_mode: bool = False,
 ) -> LTXModel:
-    """Load transformer with weights."""
+    """Load transformer with weights.
+
+    Args:
+        weights_path: Path to safetensors weights file.
+        num_layers: Number of transformer layers.
+        compute_dtype: Dtype for computation.
+        use_fp8: If True, load FP8 weights and dequantize.
+        low_memory: If True, use aggressive memory optimization.
+        fast_mode: If True, skip intermediate evaluations.
+    """
     dtype_name = "FP16" if compute_dtype == mx.float16 else "FP32"
     fp8_str = " (FP8 dequantized)" if use_fp8 else ""
     mem_str = " (low memory)" if low_memory else ""
-    print(f"Loading transformer ({dtype_name}{fp8_str}{mem_str})...")
+    fast_str = " (fast mode)" if fast_mode else ""
+    print(f"Loading transformer ({dtype_name}{fp8_str}{mem_str}{fast_str})...")
 
     model = LTXModel(
         model_type=LTXModelType.VideoOnly,
@@ -515,6 +572,7 @@ def load_transformer(
         positional_embedding_theta=10000.0,
         compute_dtype=compute_dtype,
         low_memory=low_memory,
+        fast_mode=fast_mode,
     )
 
     # Load weights
@@ -635,6 +693,7 @@ def generate_video(
     temporal_upscaler_weights: str = None,
     generate_audio: bool = False,
     low_memory: bool = False,
+    fast_mode: bool = False,
     # New parameters
     image_path: str = None,
     image_strength: float = 0.95,
@@ -677,6 +736,8 @@ def generate_video(
         print(f"Audio generation: ENABLED (stereo 24kHz)")
     if low_memory:
         print(f"Low memory mode: ENABLED (sequential CFG, aggressive eval)")
+    if fast_mode:
+        print(f"Fast mode: ENABLED (no intermediate evals)")
     if embedding_path:
         print(f"Using pre-computed embedding: {embedding_path}")
     elif use_gemma:
@@ -766,7 +827,7 @@ def generate_video(
     else:
         print("\n[2/5] Loading transformer...")
         if not use_placeholder and weights_path:
-            velocity_model = load_transformer(weights_path, num_layers=48, compute_dtype=compute_dtype, use_fp8=use_fp8, low_memory=low_memory)
+            velocity_model = load_transformer(weights_path, num_layers=48, compute_dtype=compute_dtype, use_fp8=use_fp8, low_memory=low_memory, fast_mode=fast_mode)
 
             # Apply cross-attention scaling if specified (improves text conditioning)
             if cross_attn_scale != 1.0:
@@ -1149,7 +1210,10 @@ def generate_video(
 
                         del denoised_uncond, denoised_cond
                     else:
-                        # Standard CFG: cond first, then uncond
+                        # Standard CFG: Sequential forward passes
+                        # NOTE: Batched CFG (stacking cond+uncond) was tested but found SLOWER
+                        # for 19B models because GPU is already fully utilized with batch=1.
+                        # Doubling batch just doubles compute time with no throughput gain.
                         modality_cond = Modality(
                             latent=latent_patchified,
                             context=text_encoding,
@@ -1576,6 +1640,13 @@ def main():
         help="Enable aggressive memory optimization (slower but uses ~30%% less VRAM)"
     )
     parser.add_argument(
+        "--fast-mode",
+        action="store_true",
+        help="Experimental: Skip intermediate evaluations during denoising. "
+             "May increase memory usage. Not recommended for 19B models - "
+             "the GPU is already fully utilized, so this typically doesn't help."
+    )
+    parser.add_argument(
         "--image",
         type=str,
         default=None,
@@ -1674,6 +1745,7 @@ def main():
         temporal_upscaler_weights=args.temporal_upscaler_weights,
         generate_audio=args.generate_audio,
         low_memory=args.low_memory,
+        fast_mode=args.fast_mode,
         # New parameters
         image_path=args.image,
         image_strength=args.image_strength,

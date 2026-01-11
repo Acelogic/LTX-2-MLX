@@ -46,6 +46,14 @@ class VerboseTestLogger:
             duration = time.time() - self.start_time
             self.log(f"Test completed in {duration:.2f}s", "INFO")
 
+    def log_step(self, message: str):
+        """Log a step in the test process."""
+        self.log(message, "STEP")
+
+    def log_info(self, message: str):
+        """Log an informational message."""
+        self.log(message, "INFO")
+
 
 @pytest.fixture
 def test_logger(request) -> Generator[VerboseTestLogger, None, None]:
