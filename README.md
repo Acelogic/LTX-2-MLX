@@ -62,13 +62,13 @@ curl -LsSf https://astral.sh/uv/install.sh | sh
 uv run pytest tests/ -m unit -v
 
 # Run video generation
-uv run python scripts/generate.py --prompt "Your prompt here"
+uv run python scripts/generate.py "Your prompt here"
 ```
 
 #### Using `pip`
 
 ```bash
-pip install mlx safetensors numpy pillow tqdm transformers
+pip install mlx safetensors numpy pillow tqdm einops transformers sentencepiece protobuf torch
 ```
 
 For video/audio encoding:

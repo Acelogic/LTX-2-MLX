@@ -33,6 +33,10 @@ dependencies = [
     "safetensors>=0.4.0",
     "tqdm>=4.65.0",
     "einops>=0.7.0",
+    "transformers>=4.57.3",
+    "sentencepiece>=0.2.1",
+    "protobuf>=6.33.3",
+    "torch>=2.9.1",
 ]
 
 [project.optional-dependencies]
