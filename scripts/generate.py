@@ -159,8 +159,8 @@ def load_tokenizer(model_path: str):
         from transformers import AutoTokenizer
         tokenizer = AutoTokenizer.from_pretrained(model_path)
         return tokenizer
-    except ImportError:
-        print("Error: transformers library required for tokenizer")
+    except ImportError as e:
+        print(f"Error: transformers library required for tokenizer: {e}")
         print("Install with: pip install transformers")
         return None
 
