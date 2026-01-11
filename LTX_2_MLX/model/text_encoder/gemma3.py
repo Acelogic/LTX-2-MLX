@@ -21,6 +21,8 @@ from typing import List, Optional, Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
+from LTX_2_MLX.kernels import silu_mul
+
 
 @dataclass
 class Gemma3Config:
@@ -41,11 +43,12 @@ class Gemma3Config:
 
 
 def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
-    """RMSNorm with Gemma-style +1 offset on weight."""
-    variance = mx.mean(x * x, axis=-1, keepdims=True)
-    x = x * mx.rsqrt(variance + eps)
+    """RMSNorm with Gemma-style +1 offset on weight, using optimized mx.fast kernel."""
+    # Use optimized kernel for the normalization, then apply Gemma's (1 + weight) scaling
+    # mx.fast.rms_norm handles the variance computation efficiently
+    normed = mx.fast.rms_norm(x, None, eps)
     # Gemma uses (1 + weight) instead of just weight
-    return x * (1 + weight)
+    return normed * (1 + weight)
 
 
 class Gemma3RMSNorm(nn.Module):
@@ -192,17 +195,10 @@ class Gemma3Attention(nn.Module):
             k = mx.repeat(k, self.num_kv_groups, axis=1)
             v = mx.repeat(v, self.num_kv_groups, axis=1)
 
-        # Compute attention
-        attn_weights = (q @ k.transpose(0, 1, 3, 2)) * self.scale
-
-        # Apply attention mask
-        if attention_mask is not None:
-            attn_weights = attn_weights + attention_mask
-
-        attn_weights = mx.softmax(attn_weights, axis=-1)
-
-        # Apply attention to values
-        attn_output = attn_weights @ v
+        # Compute attention using optimized Flash Attention kernel
+        attn_output = mx.fast.scaled_dot_product_attention(
+            q, k, v, scale=self.scale, mask=attention_mask
+        )
 
         # Reshape back: [batch, num_heads, seq, head_dim] -> [batch, seq, hidden]
         attn_output = attn_output.transpose(0, 2, 1, 3)
@@ -222,8 +218,8 @@ class Gemma3MLP(nn.Module):
         self.down_proj = nn.Linear(config.intermediate_size, config.hidden_size, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        # SiLU gated activation
-        return self.down_proj(nn.silu(self.gate_proj(x)) * self.up_proj(x))
+        # SiLU gated activation with fused kernel
+        return self.down_proj(silu_mul(self.gate_proj(x), self.up_proj(x)))
 
 
 class Gemma3DecoderLayer(nn.Module):

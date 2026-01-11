@@ -3,6 +3,8 @@
 import mlx.core as mx
 import mlx.nn as nn
 
+from LTX_2_MLX.kernels import silu_mul
+
 
 def gelu_approx(x: mx.array) -> mx.array:
     """
@@ -68,4 +70,5 @@ class SwiGLU(nn.Module):
         self.w_down = nn.Linear(inner_dim, dim_out, bias=False)
 
     def __call__(self, x: mx.array) -> mx.array:
-        return self.w_down(nn.silu(self.w_gate(x)) * self.w_up(x))
+        # Use fused silu_mul kernel for efficiency
+        return self.w_down(silu_mul(self.w_gate(x), self.w_up(x)))

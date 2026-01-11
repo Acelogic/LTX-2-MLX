@@ -11,6 +11,8 @@ def rms_norm(
     """
     Root-mean-square (RMS) normalize `x` over its last dimension.
 
+    Uses optimized mx.fast.rms_norm Metal kernel for efficiency.
+
     Args:
         x: Input tensor to normalize.
         weight: Optional learnable scale parameter.
@@ -19,14 +21,7 @@ def rms_norm(
     Returns:
         RMS normalized tensor.
     """
-    # Compute RMS normalization
-    variance = mx.mean(x * x, axis=-1, keepdims=True)
-    x_normed = x * mx.rsqrt(variance + eps)
-
-    if weight is not None:
-        x_normed = x_normed * weight
-
-    return x_normed
+    return mx.fast.rms_norm(x, weight, eps)
 
 
 def check_config_value(config: dict, key: str, expected: Any) -> None:

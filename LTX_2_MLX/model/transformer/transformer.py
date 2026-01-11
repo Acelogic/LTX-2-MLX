@@ -11,6 +11,40 @@ from .feed_forward import FeedForward
 from .rope import LTXRopeType
 
 
+# Compiled AdaLN helper - fuses normalization with scale/shift for better performance
+@mx.compile
+def _compiled_adaln_forward(
+    x: mx.array,
+    scale: mx.array,
+    shift: mx.array,
+    eps: float = 1e-6,
+) -> mx.array:
+    """
+    Compiled AdaLN forward: RMSNorm + scale + shift.
+
+    Fuses the normalization and modulation into a single compiled graph.
+    """
+    # RMS normalization
+    normed = mx.fast.rms_norm(x, None, eps)
+    # Apply adaptive scale and shift
+    return normed * (1 + scale) + shift
+
+
+# Compiled residual + gate - fuses residual connection with gating
+@mx.compile
+def _compiled_residual_gate(
+    x: mx.array,
+    residual: mx.array,
+    gate: mx.array,
+) -> mx.array:
+    """
+    Compiled residual with gating: x + residual * gate.
+
+    Fuses the gate multiplication and residual addition.
+    """
+    return x + residual * gate
+
+
 @dataclass
 class TransformerConfig:
     """Configuration for a transformer stream."""
@@ -158,6 +192,8 @@ class BasicTransformerBlock(nn.Module):
         """
         Forward pass through transformer block.
 
+        Uses compiled helpers for AdaLN and residual operations for better performance.
+
         Args:
             args: TransformerArgs containing hidden states and context.
 
@@ -172,26 +208,29 @@ class BasicTransformerBlock(nn.Module):
             batch_size, args.timesteps, 0, 3
         )
 
-        # Self-attention with AdaLN
-        norm_x = rms_norm(x, eps=self.norm_eps) * (1 + scale_msa) + shift_msa
-        x = x + self.attn1(norm_x, pe=args.positional_embeddings) * gate_msa
+        # Self-attention with AdaLN (using compiled helpers)
+        norm_x = _compiled_adaln_forward(x, scale_msa, shift_msa, self.norm_eps)
+        attn_out = self.attn1(norm_x, pe=args.positional_embeddings)
+        x = _compiled_residual_gate(x, attn_out, gate_msa)
 
         # Cross-attention (no AdaLN, just RMSNorm)
         # Apply cross_attn_scale to increase text conditioning influence
-        x = x + self.attn2(
+        cross_out = self.attn2(
             rms_norm(x, eps=self.norm_eps),
             context=args.context,
             mask=args.context_mask,
-        ) * self.cross_attn_scale
+        )
+        x = x + cross_out * self.cross_attn_scale
 
         # Get AdaLN values for FFN
         shift_mlp, scale_mlp, gate_mlp = self.get_ada_values(
             batch_size, args.timesteps, 3, 6
         )
 
-        # Feed-forward with AdaLN
-        x_scaled = rms_norm(x, eps=self.norm_eps) * (1 + scale_mlp) + shift_mlp
-        x = x + self.ff(x_scaled) * gate_mlp
+        # Feed-forward with AdaLN (using compiled helpers)
+        x_scaled = _compiled_adaln_forward(x, scale_mlp, shift_mlp, self.norm_eps)
+        ff_out = self.ff(x_scaled)
+        x = _compiled_residual_gate(x, ff_out, gate_mlp)
 
         return args.replace(x=x)
 

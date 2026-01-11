@@ -8,9 +8,83 @@ import mlx.nn as nn
 from .rope import LTXRopeType, apply_rotary_emb
 
 
+# Compiled attention core (without mask) - fuses reshape + SDPA + reshape
+@mx.compile
+def _compiled_attention_core_no_mask(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    heads: int,
+    dim_head: int,
+) -> mx.array:
+    """Compiled attention core without mask."""
+    b, t_q, _ = q.shape
+    _, t_k, _ = k.shape
+
+    # Reshape for multi-head attention: (B, T, H*D) -> (B, H, T, D)
+    q = q.reshape(b, t_q, heads, dim_head).transpose(0, 2, 1, 3)
+    k = k.reshape(b, t_k, heads, dim_head).transpose(0, 2, 1, 3)
+    v = v.reshape(b, t_k, heads, dim_head).transpose(0, 2, 1, 3)
+
+    # Compute attention using Flash Attention
+    scale = 1.0 / (dim_head ** 0.5)
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale)
+
+    # Reshape back: (B, H, T, D) -> (B, T, H*D)
+    return out.transpose(0, 2, 1, 3).reshape(b, t_q, heads * dim_head)
+
+
+# Compiled attention core (with mask) - fuses reshape + SDPA + reshape
+@mx.compile
+def _compiled_attention_core_with_mask(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    heads: int,
+    dim_head: int,
+    mask: mx.array,
+) -> mx.array:
+    """Compiled attention core with mask."""
+    b, t_q, _ = q.shape
+    _, t_k, _ = k.shape
+
+    # Reshape for multi-head attention: (B, T, H*D) -> (B, H, T, D)
+    q = q.reshape(b, t_q, heads, dim_head).transpose(0, 2, 1, 3)
+    k = k.reshape(b, t_k, heads, dim_head).transpose(0, 2, 1, 3)
+    v = v.reshape(b, t_k, heads, dim_head).transpose(0, 2, 1, 3)
+
+    # Handle mask dimensions
+    if mask.ndim == 2:
+        mask = mask[None, None, :, :]
+    elif mask.ndim == 3:
+        mask = mask[:, None, :, :]
+
+    # Compute attention using Flash Attention
+    scale = 1.0 / (dim_head ** 0.5)
+    out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
+
+    # Reshape back: (B, H, T, D) -> (B, T, H*D)
+    return out.transpose(0, 2, 1, 3).reshape(b, t_q, heads * dim_head)
+
+
+def _attention_core(
+    q: mx.array,
+    k: mx.array,
+    v: mx.array,
+    heads: int,
+    dim_head: int,
+    mask: Optional[mx.array] = None,
+) -> mx.array:
+    """Dispatch to compiled attention core based on mask presence."""
+    if mask is None:
+        return _compiled_attention_core_no_mask(q, k, v, heads, dim_head)
+    else:
+        return _compiled_attention_core_with_mask(q, k, v, heads, dim_head, mask)
+
+
 def rms_norm(x: mx.array, weight: Optional[mx.array] = None, eps: float = 1e-6) -> mx.array:
     """
-    Apply RMS normalization.
+    Apply RMS normalization using optimized MLX implementation.
 
     Args:
         x: Input tensor.
@@ -20,13 +94,7 @@ def rms_norm(x: mx.array, weight: Optional[mx.array] = None, eps: float = 1e-6) 
     Returns:
         RMS normalized tensor.
     """
-    variance = mx.mean(x * x, axis=-1, keepdims=True)
-    x_normed = x * mx.rsqrt(variance + eps)
-
-    if weight is not None:
-        x_normed = x_normed * weight
-
-    return x_normed
+    return mx.fast.rms_norm(x, weight, eps)
 
 
 class RMSNorm(nn.Module):
@@ -49,7 +117,10 @@ def scaled_dot_product_attention(
     scale: Optional[float] = None,
 ) -> mx.array:
     """
-    Scaled dot-product attention.
+    Scaled dot-product attention using optimized MLX implementation.
+
+    Uses mx.fast.scaled_dot_product_attention which is memory-efficient
+    (Flash Attention style) and runs optimized Metal kernels.
 
     Args:
         q: Query tensor of shape (B, H, T_q, D).
@@ -64,20 +135,7 @@ def scaled_dot_product_attention(
     if scale is None:
         scale = 1.0 / (q.shape[-1] ** 0.5)
 
-    # Compute attention scores: (B, H, T_q, T_k)
-    scores = mx.matmul(q, k.transpose(0, 1, 3, 2)) * scale
-
-    # Apply mask if provided
-    if mask is not None:
-        scores = scores + mask
-
-    # Softmax
-    weights = mx.softmax(scores, axis=-1)
-
-    # Compute output: (B, H, T_q, D)
-    out = mx.matmul(weights, v)
-
-    return out
+    return mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)
 
 
 class Attention(nn.Module):
@@ -167,26 +225,8 @@ class Attention(nn.Module):
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
-        # Reshape for multi-head attention: (B, T, H*D) -> (B, H, T, D)
-        b, t_q, _ = q.shape
-        _, t_k, _ = k.shape
-
-        q = q.reshape(b, t_q, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-        k = k.reshape(b, t_k, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-        v = v.reshape(b, t_k, self.heads, self.dim_head).transpose(0, 2, 1, 3)
-
-        # Handle mask dimensions
-        if mask is not None:
-            if mask.ndim == 2:
-                mask = mask[None, None, :, :]  # Add batch and head dims
-            elif mask.ndim == 3:
-                mask = mask[:, None, :, :]  # Add head dim
-
-        # Compute attention
-        out = scaled_dot_product_attention(q, k, v, mask)
-
-        # Reshape back: (B, H, T, D) -> (B, T, H*D)
-        out = out.transpose(0, 2, 1, 3).reshape(b, t_q, self.heads * self.dim_head)
+        # Use compiled attention core for better performance
+        out = _attention_core(q, k, v, self.heads, self.dim_head, mask)
 
         # Output projection
         return self.to_out(out)
