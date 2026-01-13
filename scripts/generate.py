@@ -728,6 +728,7 @@ def generate_video(
     canny_high: int = 200,
     control_strength: float = 0.95,
     save_control: bool = False,
+    ge_gamma: float = 0.0,
 ):
     """Generate video from text prompt."""
 
@@ -772,6 +773,8 @@ def generate_video(
         print(f"Control video: {control_video} (type={control_type}, strength={control_strength})")
         if control_type == "canny":
             print(f"  Canny thresholds: low={canny_low}, high={canny_high}")
+    if ge_gamma > 0:
+        print(f"GE denoising: gamma={ge_gamma} (velocity correction enabled)")
     if embedding_path:
         print(f"Using pre-computed embedding: {embedding_path}")
     elif use_gemma:
@@ -1140,6 +1143,9 @@ def generate_video(
     # Denoising loop with progress bar
     step_iterator = progress_bar(range(len(sigmas) - 1), desc="Denoising", total=num_steps)
 
+    # GE (Gradient Estimation) velocity tracking
+    prev_velocity = None
+
     for i in step_iterator:
         sigma = float(sigmas[i])
         sigma_next = float(sigmas[i + 1])
@@ -1423,6 +1429,21 @@ def generate_video(
                         x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
                         denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
                         denoised = stg_guider.guide(denoised, denoised_perturbed)
+
+                # Apply GE (Gradient Estimation) velocity correction if enabled
+                if ge_gamma > 0:
+                    # Compute current velocity: v = (x - x0) / sigma
+                    current_velocity = (latent - denoised) / sigma
+
+                    if prev_velocity is not None:
+                        # Apply velocity correction using momentum-like update
+                        delta_v = current_velocity - prev_velocity
+                        total_velocity = ge_gamma * delta_v + prev_velocity
+                        # Reconstruct corrected denoised: x0 = x - v * sigma
+                        denoised = latent - total_velocity * sigma
+
+                    # Update velocity for next iteration
+                    prev_velocity = current_velocity
 
                 # Euler step using X0 (denoised) prediction
                 latent = euler_step_x0(latent, denoised, sigma, sigma_next)
@@ -1889,6 +1910,13 @@ def main():
         default=0.0,
         help="APG momentum for stateful guidance (0 = disabled, try 0.5-0.9)"
     )
+    # GE (Gradient Estimation) denoising argument
+    parser.add_argument(
+        "--ge-gamma",
+        type=float,
+        default=0.0,
+        help="GE (Gradient Estimation) gamma. 0.0 disables GE, try 2.0 to reduce steps"
+    )
     # IC-LoRA control signal arguments
     parser.add_argument(
         "--control-video",
@@ -2034,6 +2062,8 @@ def main():
         canny_high=args.canny_high,
         control_strength=args.control_strength,
         save_control=args.save_control,
+        # GE (Gradient Estimation) parameter
+        ge_gamma=args.ge_gamma,
     )
 
 

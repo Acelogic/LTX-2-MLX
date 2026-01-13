@@ -103,46 +103,6 @@ video = decoder(latent, timestep=0.05)
 | No timestep conditioning | 12% |
 | timestep=0.0 | 32% |
 | timestep=0.05 (recommended) | 32-35% |
-| timestep=0.05 + bias correction | 50% ✓ |
-
----
-
-## Issue: Output Brightness Still Too Dark (35% vs 50%)
-
-### Symptoms
-- With timestep conditioning, output brightness is ~35%
-- Expected brightness from PyTorch reference is ~50%
-- Colors appear washed out or dark
-
-### Root Cause: VAE Decoder Output Bias
-
-The MLX VAE decoder outputs with a consistent negative bias of approximately -0.31. This bias is likely due to subtle numerical differences in the Conv3d implementation or normalization layers.
-
-### Solution: Add Bias Correction
-
-Add a +0.31 correction in `decode_latent()` before the final conversion:
-
-```python
-def decode_latent(latent, decoder, timestep=0.05):
-    # Decode with timestep conditioning
-    video = decoder(latent, timestep=timestep)
-
-    # Apply bias correction to center output at 0
-    # The decoder outputs with a consistent negative bias (~-0.31)
-    # This correction brings brightness from ~35% to ~50%
-    video = video + 0.31
-
-    # Convert to uint8: assume output is in [-1, 1]
-    video = mx.clip((video + 1) / 2, 0, 1) * 255
-    return video.astype(mx.uint8)
-```
-
-### Verification
-
-| Metric | Before Fix | After Fix |
-|--------|-----------|-----------|
-| Brightness | 35.4% | 51.4% |
-| Decoder output mean | -0.31 | ~0.0 |
 
 ---
 
@@ -1239,12 +1199,10 @@ Without this wrapper, the upsampling operates on incorrectly scaled values, dest
 - Frame shape was wrong: `(B, C, T, H, W)` instead of list of `(H, W, C)` frames
 
 **Solution**: Use the `decode_latent()` helper function which:
-1. Normalizes latent std if needed
+1. Un-normalizes latents (reverses per-channel normalization)
 2. Applies decoder with timestep conditioning
-3. Adds bias correction (+0.30)
-4. Applies contrast boost for large videos
-5. Converts to uint8: `mx.clip((video + 1) / 2, 0, 1) * 255`
-6. Rearranges to `(T, H, W, C)` format
+3. Converts to uint8: `mx.clip((video + 1) / 2, 0, 1) * 255`
+4. Rearranges to `(T, H, W, C)` format
 
 **Error Before Fix**:
 ```
@@ -1377,7 +1335,7 @@ Expected output:
 
 2. **Normalization Wrappers Are Critical**: When upsampling latents, the normalization wrapper preserves the statistical distribution that the decoder expects.
 
-3. **Use Helper Functions**: The `decode_latent()` helper encapsulates all the post-processing logic (bias correction, contrast boost, uint8 conversion) - use it instead of calling the decoder directly.
+3. **Use Helper Functions**: The `decode_latent()` helper encapsulates all the post-processing logic (un-normalization, uint8 conversion, rearranging) - use it instead of calling the decoder directly.
 
 4. **Validate Output Statistics**: Low variance (std < 15) in video output is a red flag indicating incorrect latent processing.
 

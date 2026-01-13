@@ -754,17 +754,18 @@ def decode_latent(
     if latent.ndim == 4:
         latent = latent[None]
 
-    # NOTE: Skipping per-channel denormalization for now
-    # The diffusion model outputs may already be in the correct space
-    # PyTorch does: x * std_of_means + mean_of_means
-    # But this makes our output too dark (std~0.15 shrinks values)
-    # TODO: Investigate if we need inverse operation or no operation
+    # Un-normalize latents before decoding
+    # The diffusion model outputs normalized latents (mean=0, std=1 per channel)
+    # The decoder expects raw latent values, so we reverse the normalization:
+    # raw = normalized * std + mean
+    std = decoder.std_of_means.reshape(1, -1, 1, 1, 1)
+    mean = decoder.mean_of_means.reshape(1, -1, 1, 1, 1)
+    latent = latent * std + mean
 
     # Decode with timestep conditioning
     video = decoder(latent, timestep=timestep)
 
     # Convert to uint8: output is in [-1, 1] (matching PyTorch)
-    # Note: Removed hardcoded +0.30 bias - decoder should output correctly centered values
     video = mx.clip((video + 1) / 2, 0, 1) * 255
     video = video.astype(mx.uint8)
 

@@ -472,17 +472,7 @@ sigmas = get_schedule_shift(num_steps=30, ...)
 DISTILLED_SIGMAS = [1.0, 0.99, 0.98, 0.93, 0.85, 0.50, 0.05]
 ```
 
-### 5. VAE Output Bias
-
-**PyTorch:** Direct output, no correction needed
-
-**MLX:** Requires +0.31 bias correction due to numerical differences:
-```python
-video = video + 0.31  # Bias correction
-video = mx.clip((video + 1) / 2, 0, 1) * 255
-```
-
-### 6. Memory Optimization
+### 5. Memory Optimization
 
 **PyTorch:**
 ```python
@@ -559,7 +549,7 @@ features = self.aggregate_embed(normed)         # [B, T, 3840]
 | Padding | LEFT | RIGHT (required) |
 | Denoising Steps | 30 (dynamic) | 7 (distilled) |
 | Conv3d | Native | Iterated Conv2d |
-| VAE Output | Direct | +0.31 bias correction |
+| VAE Decode | un_normalize then decode | Same (decode_latent handles it) |
 | Memory (Gemma) | ~24GB | ~12GB |
 | Transformer Output | Velocity | X0Model wrapper required |
 | RoPE Type | SPLIT | SPLIT (was INTERLEAVED - fixed) |
