@@ -88,30 +88,34 @@ def unpatchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.arr
 
     if x.ndim == 4:
         # 4D: (B, C*r*r, H, W) -> (B, C, H*r, W*r)
-        # Match PyTorch pixel_shuffle: channels packed as (C, r_h, r_w)
+        # PyTorch einops: "b (c r q) h w -> b c (h q) (w r)" where r=width, q=height
+        # Channel packing order: (c, r_w, r_h) with r_w for width, r_h for height
         b, c_packed, h, w = x.shape
         r = patch_size_hw
         c = c_packed // (r * r)
 
-        # Reshape: (B, C*r*r, H, W) -> (B, C, r_h, r_w, H, W)
+        # Reshape: (B, C*r*r, H, W) -> (B, C, r_w, r_h, H, W)
         x = x.reshape(b, c, r, r, h, w)
-        # Transpose: (B, C, r_h, r_w, H, W) -> (B, C, H, r_h, W, r_w)
-        x = x.transpose(0, 1, 4, 2, 5, 3)
+        # Transpose: (B, C, r_w, r_h, H, W) -> (B, C, H, r_h, W, r_w)
+        # Swap positions 2<->3 compared to naive (0,1,4,2,5,3) to match PyTorch
+        x = x.transpose(0, 1, 4, 3, 5, 2)
         # Reshape: (B, C, H, r_h, W, r_w) -> (B, C, H*r, W*r)
         x = x.reshape(b, c, h * r, w * r)
 
     elif x.ndim == 5:
         # 5D: (B, C*p*r*r, F, H, W) -> (B, C, F*p, H*r, W*r)
-        # Match PyTorch pixel_shuffle: channels packed as (C, p, r_h, r_w)
+        # PyTorch einops: "b (c p r q) f h w -> b c (f p) (h q) (w r)"
+        # Channel packing order: (c, p, r_w, r_h) with r_w for width, r_h for height
         b, c_packed, f, h, w = x.shape
         p = patch_size_t
         r = patch_size_hw
         c = c_packed // (p * r * r)
 
-        # Reshape: (B, C*p*r*r, F, H, W) -> (B, C, p, r_h, r_w, F, H, W)
+        # Reshape: (B, C*p*r*r, F, H, W) -> (B, C, p, r_w, r_h, F, H, W)
         x = x.reshape(b, c, p, r, r, f, h, w)
         # Transpose: -> (B, C, F, p, H, r_h, W, r_w)
-        x = x.transpose(0, 1, 5, 2, 6, 3, 7, 4)
+        # Swap positions 3<->4 compared to naive (0,1,5,2,6,3,7,4) to match PyTorch
+        x = x.transpose(0, 1, 5, 2, 6, 4, 7, 3)
         # Reshape: -> (B, C, F*p, H*r, W*r)
         x = x.reshape(b, c, f * p, h * r, w * r)
 
