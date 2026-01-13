@@ -33,6 +33,8 @@ from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.types import VideoLatentShape
 from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
+from LTX_2_MLX.loader.lora_loader import fuse_lora_into_weights
+from mlx.utils import tree_flatten
 from LTX_2_MLX.model.video_vae.simple_decoder import (
     SimpleVideoDecoder,
     load_vae_decoder_weights,
@@ -104,6 +106,7 @@ from LTX_2_MLX.pipelines.two_stage import (
     TwoStagePipeline,
     TwoStageCFGConfig,
 )
+from LTX_2_MLX.pipelines.common import ImageCondition
 from LTX_2_MLX.model.video_vae.simple_encoder import (
     SimpleVideoEncoder,
     load_vae_encoder_weights,
@@ -703,7 +706,11 @@ def generate_video(
     pipeline_type: str = "text-to-video",
     early_layers_only: bool = False,
     enhance_prompt_flag: bool = False,
-    cross_attn_scale: float = 1.0, distilled_lora: str = None, distilled_lora_scale: float = 1.0,
+    cross_attn_scale: float = 1.0,
+    distilled_lora: str = None,
+    distilled_lora_scale: float = 1.0,
+    stg_scale: float = 0.0,
+    stg_mode: str = "video",
 ):
     """Generate video from text prompt."""
 
@@ -738,6 +745,9 @@ def generate_video(
         print(f"Low memory mode: ENABLED (sequential CFG, aggressive eval)")
     if fast_mode:
         print(f"Fast mode: ENABLED (no intermediate evals)")
+    if stg_scale > 0:
+        print(f"STG guidance: scale={stg_scale}, mode={stg_mode}")
+        print(f"  WARNING: STG is EXPERIMENTAL - denoising loop integration pending")
     if embedding_path:
         print(f"Using pre-computed embedding: {embedding_path}")
     elif use_gemma:
@@ -841,6 +851,24 @@ def generate_video(
         else:
             model = None
             print("  Skipping model load (placeholder mode)")
+
+    # Apply LoRA if provided
+    if lora_path and model is not None:
+        print(f"\n  Applying LoRA from {lora_path} (strength={lora_strength})")
+        lora_config = LoRAConfig(path=lora_path, strength=lora_strength)
+
+        # Get target model (handle X0Model wrapper)
+        if hasattr(model, 'velocity_model'):
+            target_model = model.velocity_model
+        else:
+            target_model = model
+
+        # Fuse LoRA weights into model
+        flat_params = dict(tree_flatten(target_model.parameters()))
+        fused_weights = fuse_lora_into_weights(flat_params, [lora_config])
+        target_model.load_weights(list(fused_weights.items()))
+        mx.eval(target_model.parameters())
+        print(f"  LoRA applied successfully")
 
     # Whether to use CFG
     # Distilled models (LTX-2 distilled) are trained without CFG and produce artifacts if CFG > 1.0
@@ -965,6 +993,16 @@ def generate_video(
             distilled_lora_config=distilled_lora_config,
         )
 
+        # Create image conditionings if provided
+        images = []
+        if image_path:
+            print(f"  Image conditioning: {image_path} (strength={image_strength})")
+            images = [ImageCondition(
+                image_path=image_path,
+                frame_index=0,
+                strength=image_strength,
+            )]
+
         # Run pipeline
         print(f"\n[5/5] Running two-stage generation...")
         video = pipeline(
@@ -973,6 +1011,7 @@ def generate_video(
             negative_encoding=null_encoding,
             negative_mask=null_mask,
             config=config,
+            images=images,
         )
 
         # Convert to frames list for save_video
@@ -1735,6 +1774,19 @@ def main():
         help="LoRA strength (-2.0 to 2.0, default 1.0)"
     )
     parser.add_argument(
+        "--stg-scale",
+        type=float,
+        default=0.0,
+        help="STG (Spatio-Temporal Guidance) scale. 0.0 disables STG. (EXPERIMENTAL)"
+    )
+    parser.add_argument(
+        "--stg-mode",
+        type=str,
+        choices=["video", "audio", "both"],
+        default="video",
+        help="STG perturbation mode: video, audio, or both (EXPERIMENTAL)"
+    )
+    parser.add_argument(
         "--tiled-vae",
         action="store_true",
         help="Use tiled VAE decoding for lower memory usage"
@@ -1827,6 +1879,9 @@ def main():
         steps_stage1=args.steps_stage1,
         steps_stage2=args.steps_stage2,
         cfg_stage1=args.cfg_stage1,
+        # STG parameters
+        stg_scale=args.stg_scale,
+        stg_mode=args.stg_mode,
     )
 
 

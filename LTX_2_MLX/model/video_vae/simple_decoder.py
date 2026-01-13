@@ -735,6 +735,7 @@ def decode_latent(
     latent: mx.array,
     decoder: SimpleVideoDecoder,
     timestep: Optional[float] = 0.05,
+    key: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Decode latent to video frames.
@@ -744,6 +745,7 @@ def decode_latent(
         decoder: Loaded SimpleVideoDecoder instance.
         timestep: Timestep for conditioning (default 0.05 for denoising).
                   Use 0.0 for no denoising, None to disable timestep conditioning.
+        key: Optional random key for deterministic decoding (reserved for future use).
 
     Returns:
         Video frames as uint8 (T, H, W, 3) in [0, 255].

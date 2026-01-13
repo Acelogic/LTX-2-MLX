@@ -255,6 +255,7 @@ def decode_tiled(
     tiling_config: TilingConfig,
     timestep: Optional[float] = 0.05,
     show_progress: bool = True,
+    key: Optional[mx.array] = None,
 ) -> Iterator[mx.array]:
     """
     Decode a latent tensor using tiled processing.
@@ -268,6 +269,7 @@ def decode_tiled(
         tiling_config: Tiling configuration.
         timestep: Timestep for decoder conditioning.
         show_progress: Whether to show progress bar.
+        key: Optional random key for deterministic decoding (reserved for future use).
 
     Yields:
         Decoded video chunks (B, 3, T_chunk, H, W).

@@ -132,7 +132,7 @@ class ResnetBlock3D(nn.Module):
 
         # Timestep conditioning
         if timestep_conditioning:
-            self.scale_shift_table = mx.random.normal((4, in_channels)) / (in_channels ** 0.5)
+            self.scale_shift_table = mx.zeros((4, in_channels))
 
     def _feed_spatial_noise(
         self,

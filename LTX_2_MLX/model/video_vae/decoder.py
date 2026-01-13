@@ -287,6 +287,7 @@ class VideoDecoder(nn.Module):
 def decode_video(
     latent: mx.array,
     video_decoder: VideoDecoder,
+    key: Optional[mx.array] = None,
 ) -> mx.array:
     """
     Decode a video latent tensor with the given decoder.
@@ -294,6 +295,7 @@ def decode_video(
     Args:
         latent: Tensor (B, C, F, H, W) or (C, F, H, W).
         video_decoder: Decoder module.
+        key: Optional random key for deterministic decoding.
 
     Returns:
         Decoded video in uint8 format (F, H, W, C) in [0, 255].
@@ -302,7 +304,7 @@ def decode_video(
     if latent.ndim == 4:
         latent = latent[None, ...]
 
-    decoded_video = video_decoder(latent)
+    decoded_video = video_decoder(latent, key=key)
 
     # Convert to uint8: [-1, 1] -> [0, 255]
     frames = mx.clip((decoded_video + 1.0) / 2.0, 0.0, 1.0) * 255.0
