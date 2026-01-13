@@ -31,6 +31,7 @@ from LTX_2_MLX.model.audio_vae import (
 )
 from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
+from LTX_2_MLX.components.guiders import LtxAPGGuider, LegacyStatefulAPGGuider, STGGuider
 from LTX_2_MLX.types import VideoLatentShape
 from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
 from LTX_2_MLX.loader.lora_loader import fuse_lora_into_weights
@@ -107,6 +108,12 @@ from LTX_2_MLX.pipelines.two_stage import (
     TwoStageCFGConfig,
 )
 from LTX_2_MLX.pipelines.common import ImageCondition
+from LTX_2_MLX.pipelines.ic_lora import (
+    ControlType,
+    VideoCondition,
+    preprocess_control_signal,
+    load_control_signal_tensor,
+)
 from LTX_2_MLX.model.video_vae.simple_encoder import (
     SimpleVideoEncoder,
     load_vae_encoder_weights,
@@ -711,6 +718,16 @@ def generate_video(
     distilled_lora_scale: float = 1.0,
     stg_scale: float = 0.0,
     stg_mode: str = "video",
+    apg_scale: float = 1.0,
+    apg_eta: float = 1.0,
+    apg_norm_threshold: float = 0.0,
+    apg_momentum: float = 0.0,
+    control_video: str = None,
+    control_type: str = "raw",
+    canny_low: int = 100,
+    canny_high: int = 200,
+    control_strength: float = 0.95,
+    save_control: bool = False,
 ):
     """Generate video from text prompt."""
 
@@ -747,7 +764,14 @@ def generate_video(
         print(f"Fast mode: ENABLED (no intermediate evals)")
     if stg_scale > 0:
         print(f"STG guidance: scale={stg_scale}, mode={stg_mode}")
-        print(f"  WARNING: STG is EXPERIMENTAL - denoising loop integration pending")
+    if apg_scale != 1.0:
+        print(f"APG guidance: scale={apg_scale}, eta={apg_eta}, norm_threshold={apg_norm_threshold}")
+        if apg_momentum > 0:
+            print(f"  Using stateful APG with momentum={apg_momentum}")
+    if control_video:
+        print(f"Control video: {control_video} (type={control_type}, strength={control_strength})")
+        if control_type == "canny":
+            print(f"  Canny thresholds: low={canny_low}, high={canny_high}")
     if embedding_path:
         print(f"Using pre-computed embedding: {embedding_path}")
     elif use_gemma:
@@ -888,6 +912,30 @@ def generate_video(
             print(f"  Guidance rescale: {guidance_rescale}")
     else:
         print(f"  CFG disabled (scale {cfg_scale}) - Running optimized single-pass inference")
+
+    # Create APG guider if enabled (replaces CFG when active)
+    apg_guider = None
+    if apg_scale != 1.0:
+        if apg_momentum > 0:
+            apg_guider = LegacyStatefulAPGGuider(
+                scale=apg_scale,
+                eta=apg_eta,
+                norm_threshold=apg_norm_threshold,
+                momentum=apg_momentum,
+            )
+        else:
+            apg_guider = LtxAPGGuider(
+                scale=apg_scale,
+                eta=apg_eta,
+                norm_threshold=apg_norm_threshold,
+            )
+        print(f"  APG guidance enabled (replaces standard CFG)")
+
+    # Create STG guider if enabled
+    stg_guider = None
+    if stg_scale > 0:
+        stg_guider = STGGuider(scale=stg_scale)
+        print(f"  STG guidance enabled (scale={stg_scale})")
 
     # Load VAE decoder
     vae_decoder = None
@@ -1292,12 +1340,24 @@ def generate_video(
                         mx.eval(denoised_cond)
                         del x0_cond_patchified
 
-                        # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
-                        denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+                        # Apply guidance: APG if enabled, otherwise standard CFG
+                        if apg_guider is not None and apg_guider.enabled():
+                            denoised = apg_guider.guide(denoised_cond, denoised_uncond)
+                        else:
+                            # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
+                            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
 
                         # Apply guidance rescale to prevent variance explosion
                         if guidance_rescale > 0:
                             denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
+
+                        # Apply STG (Spatio-Temporal Guidance) if enabled
+                        if stg_guider is not None and stg_guider.enabled():
+                            # Run perturbed forward pass (skip video self-attention)
+                            x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
+                            denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
+                            denoised = stg_guider.guide(denoised, denoised_perturbed)
+                            del denoised_perturbed, x0_perturbed_patchified
 
                         del denoised_uncond, denoised_cond
                     else:
@@ -1327,12 +1387,23 @@ def generate_video(
                         x0_uncond_patchified = model(modality_uncond)
                         denoised_uncond = patchifier.unpatchify(x0_uncond_patchified, output_shape=output_shape)
 
-                        # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
-                        denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+                        # Apply guidance: APG if enabled, otherwise standard CFG
+                        if apg_guider is not None and apg_guider.enabled():
+                            denoised = apg_guider.guide(denoised_cond, denoised_uncond)
+                        else:
+                            # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
+                            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
 
                         # Apply guidance rescale to prevent variance explosion
                         if guidance_rescale > 0:
                             denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
+
+                        # Apply STG (Spatio-Temporal Guidance) if enabled
+                        if stg_guider is not None and stg_guider.enabled():
+                            # Run perturbed forward pass (skip video self-attention)
+                            x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
+                            denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
+                            denoised = stg_guider.guide(denoised, denoised_perturbed)
                 else:
                     # No CFG - just conditional pass
                     modality_cond = Modality(
@@ -1345,6 +1416,13 @@ def generate_video(
                     )
                     x0_cond_patchified = model(modality_cond)
                     denoised = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
+
+                    # Apply STG (Spatio-Temporal Guidance) if enabled (works without CFG)
+                    if stg_guider is not None and stg_guider.enabled():
+                        # Run perturbed forward pass (skip video self-attention)
+                        x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
+                        denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
+                        denoised = stg_guider.guide(denoised, denoised_perturbed)
 
                 # Euler step using X0 (denoised) prediction
                 latent = euler_step_x0(latent, denoised, sigma, sigma_next)
@@ -1786,6 +1864,68 @@ def main():
         default="video",
         help="STG perturbation mode: video, audio, or both (EXPERIMENTAL)"
     )
+    # APG (Adaptive Projected Guidance) arguments
+    parser.add_argument(
+        "--apg-scale",
+        type=float,
+        default=1.0,
+        help="APG (Adaptive Projected Guidance) scale. 1.0 disables APG, use values like 3.0-7.0"
+    )
+    parser.add_argument(
+        "--apg-eta",
+        type=float,
+        default=1.0,
+        help="APG parallel component weight (default 1.0)"
+    )
+    parser.add_argument(
+        "--apg-norm-threshold",
+        type=float,
+        default=0.0,
+        help="APG norm threshold for guidance clipping (0 = disabled)"
+    )
+    parser.add_argument(
+        "--apg-momentum",
+        type=float,
+        default=0.0,
+        help="APG momentum for stateful guidance (0 = disabled, try 0.5-0.9)"
+    )
+    # IC-LoRA control signal arguments
+    parser.add_argument(
+        "--control-video",
+        type=str,
+        default=None,
+        help="Path to control video for IC-LoRA conditioning (depth, pose, canny)"
+    )
+    parser.add_argument(
+        "--control-type",
+        type=str,
+        choices=["canny", "raw"],
+        default="raw",
+        help="Control signal type: 'canny' applies edge detection, 'raw' uses video as-is"
+    )
+    parser.add_argument(
+        "--canny-low",
+        type=int,
+        default=100,
+        help="Canny edge detection low threshold (0-255)"
+    )
+    parser.add_argument(
+        "--canny-high",
+        type=int,
+        default=200,
+        help="Canny edge detection high threshold (0-255)"
+    )
+    parser.add_argument(
+        "--control-strength",
+        type=float,
+        default=0.95,
+        help="Control signal strength (0.0-1.0, default 0.95)"
+    )
+    parser.add_argument(
+        "--save-control",
+        action="store_true",
+        help="Save the preprocessed control signal video for debugging"
+    )
     parser.add_argument(
         "--tiled-vae",
         action="store_true",
@@ -1882,6 +2022,18 @@ def main():
         # STG parameters
         stg_scale=args.stg_scale,
         stg_mode=args.stg_mode,
+        # APG parameters
+        apg_scale=args.apg_scale,
+        apg_eta=args.apg_eta,
+        apg_norm_threshold=args.apg_norm_threshold,
+        apg_momentum=args.apg_momentum,
+        # IC-LoRA control parameters
+        control_video=args.control_video,
+        control_type=args.control_type,
+        canny_low=args.canny_low,
+        canny_high=args.canny_high,
+        control_strength=args.control_strength,
+        save_control=args.save_control,
     )
 
 

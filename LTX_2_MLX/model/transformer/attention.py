@@ -59,6 +59,9 @@ def _compiled_attention_core_with_mask(
     elif mask.ndim == 3:
         mask = mask[:, None, :, :]
 
+    # Ensure mask dtype matches query dtype for scaled_dot_product_attention
+    mask = mask.astype(q.dtype)
+
     # Compute attention using Flash Attention
     scale = 1.0 / (dim_head ** 0.5)
     out = mx.fast.scaled_dot_product_attention(q, k, v, scale=scale, mask=mask)

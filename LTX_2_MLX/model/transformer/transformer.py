@@ -409,6 +409,7 @@ class BasicAVTransformerBlock(nn.Module):
         self,
         video: Optional[TransformerArgs],
         audio: Optional[TransformerArgs],
+        skip_video_self_attn: bool = False,
     ) -> tuple:
         """
         Forward pass through AudioVideo transformer block.
@@ -416,6 +417,7 @@ class BasicAVTransformerBlock(nn.Module):
         Args:
             video: Video TransformerArgs (or None if video disabled).
             audio: Audio TransformerArgs (or None if audio disabled).
+            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
 
         Returns:
             Tuple of (updated_video_args, updated_audio_args).
@@ -435,11 +437,13 @@ class BasicAVTransformerBlock(nn.Module):
             shift_msa, scale_msa, gate_msa = self.get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, 0, 3
             )
-            
+
             # Video self-attention with compiled AdaLN and residual gate
-            norm_vx = _compiled_adaln_forward(vx, scale_msa, shift_msa, self.norm_eps)
-            attn_out = self.attn1(norm_vx, pe=video.positional_embeddings)
-            vx = _compiled_residual_gate(vx, attn_out, gate_msa)
+            # Skip self-attention if STG perturbation is enabled
+            if not skip_video_self_attn:
+                norm_vx = _compiled_adaln_forward(vx, scale_msa, shift_msa, self.norm_eps)
+                attn_out = self.attn1(norm_vx, pe=video.positional_embeddings)
+                vx = _compiled_residual_gate(vx, attn_out, gate_msa)
 
             # Video cross-attention to text
             # No AdaLN here, just RMSNorm. But we apply cross_attn_scale.
