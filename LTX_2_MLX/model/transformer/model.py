@@ -643,10 +643,11 @@ class LTXModel(nn.Module):
         self,
         video_args: Optional[TransformerArgs] = None,
         audio_args: Optional[TransformerArgs] = None,
+        skip_video_self_attn: bool = False,
     ) -> Tuple[Optional[TransformerArgs], Optional[TransformerArgs]]:
         """Process transformer blocks."""
         for i, block in enumerate(self.transformer_blocks):
-            video_args, audio_args = block(video_args, audio_args)
+            video_args, audio_args = block(video_args, audio_args, skip_video_self_attn=skip_video_self_attn)
             
             # Reduce eval frequency for performance
             if self._eval_frequency > 0 and (i + 1) % self._eval_frequency == 0:
@@ -692,6 +693,7 @@ class LTXModel(nn.Module):
         self,
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
+        skip_video_self_attn: bool = False,
     ) -> Union[mx.array, Tuple[mx.array, mx.array]]:
         """
         Forward pass.
@@ -699,6 +701,7 @@ class LTXModel(nn.Module):
         Args:
             video: Input video modality (required for VideoOnly/AudioVideo).
             audio: Input audio modality (required for AudioVideo/AudioOnly).
+            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
 
         Returns:
             VideoOnly: video_velocity
@@ -751,7 +754,9 @@ class LTXModel(nn.Module):
                 )
 
         # --- Transformer Blocks ---
-        video_args, audio_args = self._process_transformer_blocks(video_args, audio_args)
+        video_args, audio_args = self._process_transformer_blocks(
+            video_args, audio_args, skip_video_self_attn=skip_video_self_attn
+        )
 
         # --- Output Processing ---
         video_out = None
@@ -794,11 +799,17 @@ class X0Model(nn.Module):
         self,
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
+        skip_video_self_attn: bool = False,
     ) -> Union[mx.array, Tuple[mx.array, mx.array]]:
         """
         Compute denoised outputs.
+
+        Args:
+            video: Video modality.
+            audio: Audio modality.
+            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
         """
-        output = self.velocity_model(video, audio)
+        output = self.velocity_model(video, audio, skip_video_self_attn=skip_video_self_attn)
 
         # Helper to denoise
         def denoise(modality, velocity):

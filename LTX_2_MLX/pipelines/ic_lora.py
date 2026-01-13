@@ -8,9 +8,12 @@ Uses a two-stage approach:
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from enum import Enum
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Union
 
 import mlx.core as mx
+import numpy as np
 
 from .common import (
     ImageCondition,
@@ -41,6 +44,198 @@ from ..types import (
     VideoLatentShape,
     VideoPixelShape,
 )
+
+
+class ControlType(Enum):
+    """Type of control signal for IC-LoRA conditioning."""
+    CANNY = "canny"
+    RAW = "raw"  # No preprocessing, use video as-is
+
+
+def preprocess_canny(
+    video_path: Union[str, Path],
+    height: int,
+    width: int,
+    num_frames: int,
+    low_threshold: int = 100,
+    high_threshold: int = 200,
+    output_path: Optional[Union[str, Path]] = None,
+) -> np.ndarray:
+    """
+    Apply Canny edge detection to a video, creating a control signal.
+
+    Args:
+        video_path: Path to input video.
+        height: Target height.
+        width: Target width.
+        num_frames: Number of frames to process.
+        low_threshold: Canny low threshold (0-255).
+        high_threshold: Canny high threshold (0-255).
+        output_path: Optional path to save the processed video.
+
+    Returns:
+        Edge video as numpy array (F, H, W, 3) in [0, 255].
+    """
+    try:
+        import cv2
+    except ImportError:
+        raise ImportError(
+            "OpenCV required for Canny preprocessing. "
+            "Install with: pip install opencv-python"
+        )
+
+    cap = cv2.VideoCapture(str(video_path))
+    frames = []
+
+    while len(frames) < num_frames:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # Resize first
+        frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
+
+        # Convert to grayscale and apply Canny
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+        edges = cv2.Canny(gray, low_threshold, high_threshold)
+
+        # Convert to 3-channel (white edges on black background)
+        edges_rgb = cv2.cvtColor(edges, cv2.COLOR_GRAY2RGB)
+        frames.append(edges_rgb)
+
+    cap.release()
+
+    if len(frames) == 0:
+        raise ValueError(f"Could not read any frames from {video_path}")
+
+    # Pad with last frame if needed
+    while len(frames) < num_frames:
+        frames.append(frames[-1])
+
+    video_np = np.stack(frames, axis=0)  # (F, H, W, 3)
+
+    # Optionally save the processed video
+    if output_path:
+        _save_control_video(video_np, str(output_path))
+
+    return video_np
+
+
+def _save_control_video(
+    video_np: np.ndarray,
+    output_path: str,
+    fps: float = 24.0,
+) -> None:
+    """Save a control video to disk for debugging/visualization."""
+    try:
+        import cv2
+    except ImportError:
+        return  # Skip saving if OpenCV not available
+
+    h, w = video_np.shape[1:3]
+    fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+    out = cv2.VideoWriter(output_path, fourcc, fps, (w, h))
+
+    for frame in video_np:
+        # Convert RGB to BGR for OpenCV
+        frame_bgr = cv2.cvtColor(frame.astype(np.uint8), cv2.COLOR_RGB2BGR)
+        out.write(frame_bgr)
+
+    out.release()
+
+
+def preprocess_control_signal(
+    video_path: Union[str, Path],
+    control_type: ControlType,
+    height: int,
+    width: int,
+    num_frames: int,
+    output_path: Optional[Union[str, Path]] = None,
+    **kwargs,
+) -> np.ndarray:
+    """
+    Preprocess a video to create a control signal for IC-LoRA.
+
+    Args:
+        video_path: Path to input video.
+        control_type: Type of control signal (canny, raw).
+        height: Target height.
+        width: Target width.
+        num_frames: Number of frames.
+        output_path: Optional path to save preprocessed video.
+        **kwargs: Control-type-specific parameters:
+            - canny: low_threshold (int), high_threshold (int)
+
+    Returns:
+        Control signal video (F, H, W, 3) in [0, 255].
+    """
+    if control_type == ControlType.CANNY:
+        return preprocess_canny(
+            video_path=video_path,
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            low_threshold=kwargs.get("low_threshold", 100),
+            high_threshold=kwargs.get("high_threshold", 200),
+            output_path=output_path,
+        )
+    elif control_type == ControlType.RAW:
+        # Load video without preprocessing
+        try:
+            import cv2
+        except ImportError:
+            raise ImportError(
+                "OpenCV required for video loading. "
+                "Install with: pip install opencv-python"
+            )
+
+        cap = cv2.VideoCapture(str(video_path))
+        frames = []
+
+        while len(frames) < num_frames:
+            ret, frame = cap.read()
+            if not ret:
+                break
+            frame = cv2.resize(frame, (width, height), interpolation=cv2.INTER_LANCZOS4)
+            frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            frames.append(frame)
+
+        cap.release()
+
+        if len(frames) == 0:
+            raise ValueError(f"Could not read any frames from {video_path}")
+
+        while len(frames) < num_frames:
+            frames.append(frames[-1])
+
+        return np.stack(frames, axis=0)
+    else:
+        raise ValueError(f"Unknown control type: {control_type}")
+
+
+def load_control_signal_tensor(
+    control_signal: np.ndarray,
+    dtype: mx.Dtype = mx.float32,
+) -> mx.array:
+    """
+    Convert a control signal numpy array to MLX tensor for VAE encoding.
+
+    Args:
+        control_signal: Control video (F, H, W, 3) in [0, 255].
+        dtype: Output dtype.
+
+    Returns:
+        Tensor (1, 3, F, H, W) normalized to [-1, 1].
+    """
+    # Normalize to [-1, 1]
+    video_np = control_signal.astype(np.float32) / 127.5 - 1.0
+
+    # Convert to MLX: (F, H, W, C) -> (1, C, F, H, W)
+    video_mx = mx.array(video_np)
+    video_mx = mx.transpose(video_mx, (3, 0, 1, 2))  # (C, F, H, W)
+    video_mx = video_mx[None, :, :, :, :]  # (1, C, F, H, W)
+
+    return video_mx.astype(dtype)
 
 
 @dataclass
@@ -84,6 +279,12 @@ class VideoCondition:
 
     video_path: str
     strength: float = 0.95
+    control_type: ControlType = ControlType.RAW
+    # Canny-specific parameters
+    canny_low: int = 100
+    canny_high: int = 200
+    # Whether to save the preprocessed control signal
+    save_control: bool = False
 
 
 def load_video_tensor(
@@ -149,13 +350,53 @@ def create_video_conditionings(
     num_frames: int,
     dtype: mx.Dtype = mx.float32,
 ) -> List[ConditioningItem]:
-    """Create conditionings for control videos (depth, pose, etc.)."""
+    """
+    Create conditionings for control videos (depth, pose, canny, etc.).
+
+    This function handles preprocessing based on the control type:
+    - CANNY: Apply Canny edge detection to create edge maps
+    - RAW: Use the video as-is (e.g., pre-processed depth maps)
+
+    Args:
+        videos: List of VideoCondition objects with paths and settings.
+        video_encoder: VAE encoder for encoding control signals.
+        height: Target height (will be halved for stage 1).
+        width: Target width (will be halved for stage 1).
+        num_frames: Number of frames to process.
+        dtype: Data type for tensors.
+
+    Returns:
+        List of ConditioningItem objects for the denoising loop.
+    """
     conditionings = []
 
     for vid_cond in videos:
-        video_tensor = load_video_tensor(
-            vid_cond.video_path, height, width, num_frames, dtype
-        )
+        # Preprocess based on control type
+        if vid_cond.control_type == ControlType.CANNY:
+            # Determine output path for saving preprocessed video
+            output_path = None
+            if vid_cond.save_control:
+                base_path = vid_cond.video_path.rsplit(".", 1)[0]
+                output_path = f"{base_path}_canny.mp4"
+
+            control_signal = preprocess_control_signal(
+                video_path=vid_cond.video_path,
+                control_type=vid_cond.control_type,
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                output_path=output_path,
+                low_threshold=vid_cond.canny_low,
+                high_threshold=vid_cond.canny_high,
+            )
+            video_tensor = load_control_signal_tensor(control_signal, dtype)
+        else:
+            # RAW: load video directly
+            video_tensor = load_video_tensor(
+                vid_cond.video_path, height, width, num_frames, dtype
+            )
+
+        # Encode through VAE
         encoded_video = video_encoder(video_tensor)
         mx.eval(encoded_video)
 
