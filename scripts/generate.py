@@ -257,7 +257,7 @@ def encode_with_gemma(
     prompt: str,
     gemma_path: str,
     ltx_weights_path: str,
-    max_length: int = 256,
+    max_length: int = 1024,
     use_early_layers_only: bool = False,
 ) -> tuple:
     """
@@ -281,9 +281,10 @@ def encode_with_gemma(
     if tokenizer is None:
         return None, None
 
-    # CRITICAL: Use right padding to avoid NaN in attention
-    # Left padding causes all-inf attention rows for padding positions
-    tokenizer.padding_side = "right"
+    # Match PyTorch tokenizer behavior: left padding with EOS as pad token.
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
 
     print(f"  Loading Gemma 3 model...")
     config = Gemma3Config()
@@ -357,7 +358,7 @@ def encode_with_gemma(
         encoded = text_encoder.feature_extractor.extract_from_hidden_states(
             hidden_states=all_hidden_states,
             attention_mask=attention_mask,
-            padding_side="right",
+            padding_side="left",
         )
 
         # Use connector (1D transformer with learnable registers)

@@ -754,13 +754,8 @@ def decode_latent(
     if latent.ndim == 4:
         latent = latent[None]
 
-    # Un-normalize latents before decoding
-    # The diffusion model outputs normalized latents (mean=0, std=1 per channel)
-    # The decoder expects raw latent values, so we reverse the normalization:
-    # raw = normalized * std + mean
-    std = decoder.std_of_means.reshape(1, -1, 1, 1, 1)
-    mean = decoder.mean_of_means.reshape(1, -1, 1, 1, 1)
-    latent = latent * std + mean
+    # Note: Un-normalization is handled internally by SimpleVideoDecoder.__call__()
+    # at lines 476-477, so we pass the normalized latent directly.
 
     # Decode with timestep conditioning
     video = decoder(latent, timestep=timestep)

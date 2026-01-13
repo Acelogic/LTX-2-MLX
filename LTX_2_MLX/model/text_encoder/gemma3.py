@@ -305,6 +305,13 @@ class Gemma3Model(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
+        # Match HF Gemma behavior: derive positions from the attention mask.
+        if position_ids is None and attention_mask is not None:
+            position_ids = mx.cumsum(attention_mask, axis=1) - 1
+            position_ids = mx.where(attention_mask == 0, mx.zeros_like(position_ids), position_ids)
+            # Current pipeline encodes a single prompt per call.
+            position_ids = position_ids[0].astype(mx.int32)
+
         # Get embeddings and scale by sqrt(hidden_size)
         hidden_states = self.embed_tokens(input_ids) * self.embed_scale
 
@@ -313,6 +320,7 @@ class Gemma3Model(nn.Module):
 
         # Create causal mask if needed
         if attention_mask is not None:
+            binary_attention_mask = attention_mask
             # Convert binary mask to additive mask
             # 1 -> 0, 0 -> -inf
             causal_mask = mx.triu(
@@ -322,10 +330,13 @@ class Gemma3Model(nn.Module):
             # Add padding mask: 1 -> 0, 0 -> -inf
             # Use mx.where to avoid 0 * -inf = NaN
             padding_mask = mx.where(
-                attention_mask[:, None, None, :] == 1,
+                binary_attention_mask[:, None, None, :] == 1,
                 mx.zeros((1,)),
                 mx.full((1,), float("-inf")),
             )
+            # Avoid all -inf rows for padded queries with left padding.
+            query_is_pad = binary_attention_mask[:, None, :, None] == 0
+            padding_mask = mx.where(query_is_pad, mx.zeros_like(padding_mask), padding_mask)
             attention_mask = causal_mask[None, None, :, :] + padding_mask
 
         # Process through layers

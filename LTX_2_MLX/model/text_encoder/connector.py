@@ -188,26 +188,34 @@ class Embeddings1DConnector(nn.Module):
                 f"num_learnable_registers {self.num_learnable_registers}"
             )
 
+        batch_size, _, hidden_dim = hidden_states.shape
+
         # Tile registers to match sequence length
         num_duplications = seq_len // self.num_learnable_registers
         tiled_registers = mx.tile(
             self.learnable_registers[None, :, :],
-            (hidden_states.shape[0], num_duplications, 1),
+            (batch_size, num_duplications, 1),
         )
 
         # Create binary mask from attention mask
         # attention_mask is additive: 0 = attend, large negative = don't attend
         mask_squeezed = attention_mask.squeeze(1).squeeze(1)  # [B, T]
         is_valid = (mask_squeezed >= -9000.0)  # [B, T]
-        is_valid_expanded = is_valid[:, :, None]  # [B, T, 1]
 
-        # Replace padded positions with learnable registers
-        # Where is_valid is False (padded), use registers
-        is_padded = ~is_valid_expanded  # [B, T, 1]
-        hidden_states = mx.where(
-            is_padded,
-            tiled_registers,
-            hidden_states,
+        # Move valid tokens to the front (matching PyTorch behavior)
+        idx = mx.arange(seq_len, dtype=mx.int32)[None, :]
+        valid_int = is_valid.astype(mx.int32)
+        sort_key = (1 - valid_int) * seq_len + idx
+        order = mx.argsort(sort_key, axis=1)
+        adjusted_hidden_states = mx.take_along_axis(
+            hidden_states, order[:, :, None], axis=1
+        )
+
+        # Flip mask so registers fill the padded tail positions
+        flipped_mask = is_valid.astype(hidden_states.dtype)[:, ::-1, None]
+        hidden_states = (
+            flipped_mask * adjusted_hidden_states
+            + (1 - flipped_mask) * tiled_registers
         )
 
         # Clear the attention mask (all positions now valid)
