@@ -277,7 +277,13 @@ class DistilledPipeline:
 
         # ====== STAGE 2: Upsample and refine ======
         # Upsample the latent 2x
-        upscaled_latent = self.spatial_upscaler(stage_1_latent)
+        # CRITICAL: Un-normalize before upsampling, re-normalize after
+        # The upsampler model is trained on raw (un-normalized) latents
+        # Reference: PyTorch upsample_video() in ltx_core/model/upsampler/model.py
+        latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
+        upscaled_unnorm = self.spatial_upscaler(latent_unnorm)
+        mx.eval(upscaled_unnorm)
+        upscaled_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
         mx.eval(upscaled_latent)
 
         # Create stage 2 output shape (full resolution)

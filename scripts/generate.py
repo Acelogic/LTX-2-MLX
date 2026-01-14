@@ -1489,9 +1489,30 @@ def generate_video(
         spatial_upscaler = SpatialUpscaler()
         load_spatial_upscaler_weights(spatial_upscaler, spatial_upscaler_weights)
 
-        # Upscale latent
-        latent = spatial_upscaler(latent)
-        mx.eval(latent)
+        # CRITICAL: Un-normalize before upsampling, re-normalize after
+        # The upsampler model is trained on raw (un-normalized) latents
+        # Reference: PyTorch upsample_video() in ltx_core/model/upsampler/model.py
+        if vae_decoder is not None:
+            # Un-normalize: latent_raw = latent * std + mean
+            std = vae_decoder.std_of_means.reshape(1, -1, 1, 1, 1)
+            mean = vae_decoder.mean_of_means.reshape(1, -1, 1, 1, 1)
+            latent_unnorm = latent * std + mean
+            print(f"  Un-normalized: std={float(mx.std(latent_unnorm)):.3f}")
+
+            # Upscale the un-normalized latent
+            latent_upscaled = spatial_upscaler(latent_unnorm)
+            mx.eval(latent_upscaled)
+
+            # Re-normalize: latent = (latent_raw - mean) / std
+            latent = (latent_upscaled - mean) / std
+            mx.eval(latent)
+            print(f"  Re-normalized: std={float(mx.std(latent)):.3f}")
+        else:
+            # Fallback: upscale directly (may have incorrect dynamic range)
+            print("  WARNING: No VAE decoder for normalization - output may have wrong range")
+            latent = spatial_upscaler(latent)
+            mx.eval(latent)
+
         print(f"  Upscaled latent: {latent.shape}")
 
         # Clear upscaler from memory
@@ -1508,9 +1529,30 @@ def generate_video(
         temporal_upscaler = TemporalUpscaler()
         load_temporal_upscaler_weights(temporal_upscaler, temporal_upscaler_weights)
 
-        # Upscale latent
-        latent = temporal_upscaler(latent)
-        mx.eval(latent)
+        # CRITICAL: Un-normalize before upsampling, re-normalize after
+        # The upsampler model is trained on raw (un-normalized) latents
+        # Reference: PyTorch upsample_video() in ltx_core/model/upsampler/model.py
+        if vae_decoder is not None:
+            # Un-normalize: latent_raw = latent * std + mean
+            std = vae_decoder.std_of_means.reshape(1, -1, 1, 1, 1)
+            mean = vae_decoder.mean_of_means.reshape(1, -1, 1, 1, 1)
+            latent_unnorm = latent * std + mean
+            print(f"  Un-normalized: std={float(mx.std(latent_unnorm)):.3f}")
+
+            # Upscale the un-normalized latent
+            latent_upscaled = temporal_upscaler(latent_unnorm)
+            mx.eval(latent_upscaled)
+
+            # Re-normalize: latent = (latent_raw - mean) / std
+            latent = (latent_upscaled - mean) / std
+            mx.eval(latent)
+            print(f"  Re-normalized: std={float(mx.std(latent)):.3f}")
+        else:
+            # Fallback: upscale directly (may have incorrect dynamic range)
+            print("  WARNING: No VAE decoder for normalization - output may have wrong range")
+            latent = temporal_upscaler(latent)
+            mx.eval(latent)
+
         print(f"  Upscaled latent: {latent.shape}")
 
         # Clear upscaler from memory

@@ -169,11 +169,13 @@ class PixelShuffle2d(nn.Module):
         r = self.r
         c_out = c // (r * r)
 
-        # Reshape: (B, H, W, C*r*r) -> (B, H, W, r, r, C)
-        x = x.reshape(b, h, w, r, r, c_out)
+        # PyTorch pixel_shuffle packs channels as (C, r_h, r_w) where C is slowest
+        # Reshape: (B, H, W, C*r*r) -> (B, H, W, C, r_h, r_w)
+        x = x.reshape(b, h, w, c_out, r, r)
 
-        # Permute to interleave: (B, H, r, W, r, C)
-        x = x.transpose(0, 1, 3, 2, 4, 5)
+        # Permute to interleave spatial dims with their upscale factors
+        # (B, H, W, C, r_h, r_w) -> (B, H, r_h, W, r_w, C)
+        x = x.transpose(0, 1, 4, 2, 5, 3)
 
         # Reshape to final: (B, H*r, W*r, C)
         x = x.reshape(b, h * r, w * r, c_out)
