@@ -32,6 +32,7 @@ from LTX_2_MLX.model.audio_vae import (
 from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.components.guiders import LtxAPGGuider, LegacyStatefulAPGGuider, STGGuider
+from LTX_2_MLX.components.perturbations import create_batched_stg_config
 from LTX_2_MLX.types import VideoLatentShape
 from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
 from LTX_2_MLX.loader.lora_loader import fuse_lora_into_weights
@@ -71,10 +72,11 @@ def batched_cfg_forward(
     batched_timesteps = mx.array([sigma, sigma])
 
     # Single batched modality
+    # NOTE: context_mask=None matches PyTorch behavior - they don't use text masks
     batched_modality = Modality(
         latent=batched_latent,
         context=batched_context,
-        context_mask=batched_mask,
+        context_mask=None,
         timesteps=batched_timesteps,
         positions=batched_positions,
         enabled=True,
@@ -96,6 +98,8 @@ from LTX_2_MLX.model.text_encoder.gemma3 import (
 from LTX_2_MLX.model.text_encoder.encoder import (
     create_text_encoder,
     load_text_encoder_weights,
+    create_av_text_encoder,
+    load_av_text_encoder_weights,
 )
 from LTX_2_MLX.model.upscaler import (
     SpatialUpscaler,
@@ -106,6 +110,10 @@ from LTX_2_MLX.model.upscaler import (
 from LTX_2_MLX.pipelines.two_stage import (
     TwoStagePipeline,
     TwoStageCFGConfig,
+)
+from LTX_2_MLX.pipelines.one_stage import (
+    OneStagePipeline,
+    OneStageCFGConfig,
 )
 from LTX_2_MLX.pipelines.common import ImageCondition
 from LTX_2_MLX.pipelines.ic_lora import (
@@ -399,6 +407,107 @@ def encode_with_gemma(
     mx.metal.clear_cache()
 
     return encoded, original_mask
+
+
+def encode_with_av_gemma(
+    prompt: str,
+    gemma_path: str,
+    ltx_weights_path: str,
+    max_length: int = 1024,
+) -> tuple:
+    """
+    Encode a text prompt using the AudioVideo Gemma 3 + LTX-2 text encoder pipeline.
+
+    This returns both video and audio encodings, which are processed through
+    separate embedding connectors.
+
+    Args:
+        prompt: Text prompt to encode.
+        gemma_path: Path to Gemma 3 weights directory.
+        ltx_weights_path: Path to LTX-2 AudioVideo weights (for text encoder projection).
+        max_length: Maximum token length.
+
+    Returns:
+        Tuple of (video_encoding, audio_encoding, attention_mask) as MLX arrays.
+    """
+    print(f"  Loading tokenizer from {gemma_path}...")
+    tokenizer = load_tokenizer(gemma_path)
+    if tokenizer is None:
+        return None, None, None
+
+    # Match PyTorch tokenizer behavior: left padding with EOS as pad token.
+    tokenizer.padding_side = "left"
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+
+    print(f"  Loading Gemma 3 model...")
+    config = Gemma3Config()
+    gemma = Gemma3Model(config)
+    # IMPORTANT: Use FP32 for Gemma - the model was trained with BF16 which has
+    # the same exponent range as FP32. Using FP16 causes numerical overflow.
+    load_gemma3_weights(gemma, gemma_path, use_fp16=False)
+
+    print(f"  Loading AV text encoder projection...")
+    text_encoder = create_av_text_encoder()
+    load_av_text_encoder_weights(text_encoder, ltx_weights_path)
+
+    # Tokenize prompt directly (skip chat template - it dilutes the signal)
+    print(f"  Tokenizing prompt...")
+    encoding = tokenizer(
+        prompt,
+        return_tensors="np",
+        padding="max_length",
+        truncation=True,
+        max_length=max_length,
+    )
+
+    input_ids = mx.array(encoding["input_ids"])
+    attention_mask = mx.array(encoding["attention_mask"])
+
+    num_tokens = int(attention_mask.sum())
+    print(f"  Token count: {num_tokens}/{max_length}")
+
+    # Run through Gemma to get hidden states
+    print(f"  Running Gemma 3 forward pass (48 layers)...")
+    last_hidden, all_hidden_states = gemma(
+        input_ids,
+        attention_mask=attention_mask,
+        output_hidden_states=True,
+    )
+    mx.eval(last_hidden)
+
+    if all_hidden_states is None:
+        print("  Error: Gemma model did not return hidden states")
+        return None, None, None
+
+    print(f"  Got {len(all_hidden_states)} hidden states")
+
+    # Run through AV text encoder pipeline
+    print(f"  Processing through AV text encoder pipeline...")
+    av_output = text_encoder.encode_from_hidden_states(
+        hidden_states=all_hidden_states,
+        attention_mask=attention_mask,
+        padding_side="left",
+    )
+    mx.eval(av_output.video_encoding)
+    mx.eval(av_output.audio_encoding)
+
+    print(f"  Video encoding shape: {av_output.video_encoding.shape}")
+    print(f"  Audio encoding shape: {av_output.audio_encoding.shape}")
+
+    # === MEMORY OPTIMIZATION ===
+    # Clear Gemma and text encoder from memory after encoding
+    print(f"  Clearing Gemma from memory...")
+    del gemma
+    del text_encoder
+    del all_hidden_states
+    del last_hidden
+    del tokenizer
+    gc.collect()
+    # Force MLX to release memory
+    mx.metal.clear_cache()
+
+    return av_output.video_encoding, av_output.audio_encoding, av_output.attention_mask
 
 
 def create_dummy_text_encoding(
@@ -801,9 +910,16 @@ def generate_video(
         print(f"  Using enhanced prompt for generation")
 
     # Get text encoding
+    # Initialize audio encodings (used only when generate_audio=True)
+    text_audio_encoding = None
+    null_audio_encoding = None
+
     print("\n[1/5] Encoding prompt...")
     if embedding_path:
         text_encoding, text_mask = load_text_embedding(embedding_path)
+        if generate_audio:
+            print("  WARNING: Pre-computed embeddings don't include audio encoding. Audio quality may be degraded.")
+            text_audio_encoding = text_encoding  # Fallback: use video encoding for audio
     elif use_gemma:
         # Check if Gemma weights exist
         if not os.path.exists(gemma_path):
@@ -813,39 +929,70 @@ def generate_video(
             print(f"\n  Or use --no-gemma flag to use dummy embeddings for testing")
             return
 
-        # Use real Gemma encoding
-        text_encoding, text_mask = encode_with_gemma(
-            prompt=prompt,
-            gemma_path=gemma_path,
-            ltx_weights_path=weights_path,
-            use_early_layers_only=early_layers_only,
-        )
-        if text_encoding is None:
-            print("  ERROR: Failed to encode prompt")
-            return
-        print(f"  Encoded with Gemma 3")
+        if generate_audio:
+            # Use AudioVideo Gemma encoder (returns both video and audio encodings)
+            text_encoding, text_audio_encoding, text_mask = encode_with_av_gemma(
+                prompt=prompt,
+                gemma_path=gemma_path,
+                ltx_weights_path=weights_path,
+            )
+            if text_encoding is None:
+                print("  ERROR: Failed to encode prompt with AV encoder")
+                return
+            print(f"  Encoded with Gemma 3 (AudioVideo)")
+        else:
+            # Use video-only Gemma encoding
+            text_encoding, text_mask = encode_with_gemma(
+                prompt=prompt,
+                gemma_path=gemma_path,
+                ltx_weights_path=weights_path,
+                use_early_layers_only=early_layers_only,
+            )
+            if text_encoding is None:
+                print("  ERROR: Failed to encode prompt")
+                return
+            print(f"  Encoded with Gemma 3")
     else:
         text_encoding, text_mask = create_dummy_text_encoding(prompt)
+        if generate_audio:
+            text_audio_encoding = text_encoding  # Fallback for dummy mode
         print("  Using DUMMY encoding (test mode - output will be random)")
 
     # Create null encoding for CFG (unconditional)
     # For proper CFG, encode empty string through text encoder (not zeros)
     if use_gemma and gemma_path and os.path.exists(gemma_path):
         print("  Encoding empty prompt for CFG unconditional...")
-        null_encoding, null_mask = encode_with_gemma(
-            prompt="",  # Empty string for unconditional
-            gemma_path=gemma_path,
-            ltx_weights_path=weights_path,
-            max_length=text_encoding.shape[1],
-            use_early_layers_only=early_layers_only,
-        )
-        if null_encoding is None:
-            print("  WARNING: Failed to encode empty prompt, using zeros fallback")
-            null_encoding, null_mask = create_null_text_encoding(
-                batch_size=1,
-                max_tokens=text_encoding.shape[1],
-                embed_dim=text_encoding.shape[2],
+        if generate_audio:
+            # Use AudioVideo encoder for null encoding too
+            null_encoding, null_audio_encoding, null_mask = encode_with_av_gemma(
+                prompt="",  # Empty string for unconditional
+                gemma_path=gemma_path,
+                ltx_weights_path=weights_path,
+                max_length=text_encoding.shape[1],
             )
+            if null_encoding is None:
+                print("  WARNING: Failed to encode empty prompt with AV encoder, using zeros fallback")
+                null_encoding, null_mask = create_null_text_encoding(
+                    batch_size=1,
+                    max_tokens=text_encoding.shape[1],
+                    embed_dim=text_encoding.shape[2],
+                )
+                null_audio_encoding = null_encoding  # Fallback
+        else:
+            null_encoding, null_mask = encode_with_gemma(
+                prompt="",  # Empty string for unconditional
+                gemma_path=gemma_path,
+                ltx_weights_path=weights_path,
+                max_length=text_encoding.shape[1],
+                use_early_layers_only=early_layers_only,
+            )
+            if null_encoding is None:
+                print("  WARNING: Failed to encode empty prompt, using zeros fallback")
+                null_encoding, null_mask = create_null_text_encoding(
+                    batch_size=1,
+                    max_tokens=text_encoding.shape[1],
+                    embed_dim=text_encoding.shape[2],
+                )
     else:
         # Fallback to zeros when Gemma is not available
         null_encoding, null_mask = create_null_text_encoding(
@@ -853,6 +1000,8 @@ def generate_video(
             max_tokens=text_encoding.shape[1],
             embed_dim=text_encoding.shape[2],
         )
+        if generate_audio:
+            null_audio_encoding = null_encoding  # Fallback
 
     # Load model
     if generate_audio:
@@ -1059,9 +1208,7 @@ def generate_video(
         print(f"\n[5/5] Running two-stage generation...")
         video = pipeline(
             positive_encoding=text_encoding,
-            positive_mask=text_mask,
             negative_encoding=null_encoding,
-            negative_mask=null_mask,
             config=config,
             images=images,
         )
@@ -1078,47 +1225,111 @@ def generate_video(
         print(f"Done! Video saved to {output_path}")
         return
 
-    # === STANDARD PIPELINE (one-stage, distilled, etc.) ===
-    # Initialize noise
-    print("\n[4/5] Initializing latent noise...")
-    latent = mx.random.normal(shape=(1, 128, latent_frames, latent_height, latent_width))
-
-    # Initialize audio latent if generating audio
-    audio_latent = None
-    audio_decoder = None
-    vocoder = None
+    # === AUDIO-VIDEO PIPELINE ===
+    # Use OneStagePipeline for joint audio-video generation
     if generate_audio:
-        # Audio latent dimensions (matching audio VAE):
-        # - 8 VAE latent channels (same as z_channels in AudioDecoder)
-        # - Temporal length calculated from video duration (NOT video latent frames!)
-        # - 16 mel frequency bins in latent space (64 mel bins / 4 downsample)
-        # Note: Transformer uses 128 channels = 8 * 16 (channels × mel_bins flattened)
-        audio_vae_channels = 8
-        audio_mel_bins = 16  # 64 mel bins / 4 downsample factor
+        print("\n=== Using Audio-Video Pipeline ===")
 
-        # Calculate audio latent frames from video duration
-        # Video: num_frames at 24fps = duration in seconds
-        # Audio latent: sample_rate / hop_length / downsample_factor = latents per second
-        video_fps = 24.0
-        video_duration = num_frames / video_fps  # e.g., 17 frames / 24fps = 0.708s
-        audio_sample_rate = 16000  # Mel spectrogram sample rate (not output rate)
-        audio_hop_length = 160
-        audio_downsample_factor = 4
-        audio_latents_per_second = audio_sample_rate / audio_hop_length / audio_downsample_factor  # 25
-        audio_latent_frames = max(1, round(video_duration * audio_latents_per_second))
+        if model is None:
+            if use_placeholder:
+                print("  Audio generation requires model - cannot use placeholder mode")
+                return
+            raise ValueError("Audio generation requires a loaded AudioVideo model")
 
-        audio_latent = mx.random.normal(shape=(1, audio_vae_channels, audio_latent_frames, audio_mel_bins))
-        print(f"  Video latent: {latent.shape}")
-        print(f"  Audio latent: {audio_latent.shape} ({audio_latent_frames} frames for {video_duration:.2f}s video)")
+        if vae_decoder is None and not use_placeholder:
+            raise ValueError("Audio generation requires VAE decoder")
 
-        # Load audio decoder and vocoder
+        # Load VAE encoder (needed for image conditioning)
+        print("[3.5/5] Loading VAE encoder...")
+        video_encoder = SimpleVideoEncoder(compute_dtype=compute_dtype)
+        if weights_path and not use_placeholder:
+            load_vae_encoder_weights(video_encoder, weights_path)
+        else:
+            print("  Skipping weights load (placeholder)")
+
+        # Load audio components
         print("  Loading Audio VAE decoder...")
         audio_decoder = AudioDecoder(compute_dtype=compute_dtype)
-        load_audio_decoder_weights(audio_decoder, weights_path)
+        if weights_path:
+            load_audio_decoder_weights(audio_decoder, weights_path)
 
         print("  Loading Vocoder...")
         vocoder = Vocoder(compute_dtype=compute_dtype)
-        load_vocoder_weights(vocoder, weights_path)
+        if weights_path:
+            load_vocoder_weights(vocoder, weights_path)
+
+        # Create one-stage pipeline with audio support
+        print("\n[4/5] Creating audio-video pipeline...")
+        av_pipeline = OneStagePipeline(
+            transformer=model,
+            video_encoder=video_encoder,
+            video_decoder=vae_decoder,
+            audio_decoder=audio_decoder,
+            vocoder=vocoder,
+        )
+
+        # Create config with audio enabled
+        av_config = OneStageCFGConfig(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            fps=24.0,
+            num_inference_steps=num_steps,
+            cfg_scale=cfg_scale,
+            dtype=compute_dtype,
+            audio_enabled=True,
+        )
+
+        # Create image conditionings if provided
+        images = []
+        if image_path:
+            print(f"  Image conditioning: {image_path} (strength={image_strength})")
+            images = [ImageCondition(
+                image_path=image_path,
+                frame_index=0,
+                strength=image_strength,
+            )]
+
+        # Run pipeline with audio
+        print(f"\n[5/5] Running audio-video generation ({num_steps} steps)...")
+
+        def progress_callback(step: int, total: int):
+            print(f"\r  Denoising: {step}/{total}", end="", flush=True)
+
+        video, audio_waveform = av_pipeline(
+            positive_encoding=text_encoding,
+            negative_encoding=null_encoding,
+            config=av_config,
+            images=images,
+            callback=progress_callback,
+            positive_audio_encoding=text_audio_encoding,
+            negative_audio_encoding=null_audio_encoding,
+        )
+        print()  # newline after progress
+
+        # Convert to frames list for save_video
+        video_np = np.array(video)  # (T, H, W, C)
+        frames = [video_np[t] for t in range(video_np.shape[0])]
+        print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
+
+        if audio_waveform is not None:
+            print(f"  Generated audio: {audio_waveform.shape}")
+
+        # Save video with audio
+        print(f"\nSaving video to {output_path}...")
+        if audio_waveform is not None:
+            save_video_with_audio(frames, audio_waveform, output_path, fps=24)
+        else:
+            save_video(frames, output_path, fps=24)
+        print(f"Done! Video saved to {output_path}")
+        return
+
+    # === STANDARD PIPELINE (one-stage, distilled, video-only) ===
+    # Note: Audio generation is handled by the AUDIO-VIDEO PIPELINE above
+    # Initialize noise
+    print("\n[4/5] Initializing latent noise...")
+    latent = mx.random.normal(shape=(1, 128, latent_frames, latent_height, latent_width))
 
     # Get sigma schedule based on model variant
     # The distilled model was trained with specific sigma values
@@ -1178,288 +1389,162 @@ def generate_video(
             other_positions = positions[:, 1:, ...]
             positions = mx.concatenate([temporal_positions, other_positions], axis=1)
 
-            if generate_audio and audio_latent is not None:
-                # === AudioVideo mode ===
-                # Patchify audio latent: [B, C, F, mel] -> [B, F, C*mel]
-                # Flatten channels and mel into features for transformer (8 * 16 = 128)
-                b, c, f, mel = audio_latent.shape  # (1, 8, F, 16)
-                audio_latent_patchified = audio_latent.transpose(0, 2, 1, 3)  # (B, F, C, mel)
-                audio_latent_patchified = audio_latent_patchified.reshape(b, f, c * mel)  # (B, F, 128)
+            # === Video-only mode with X0 prediction ===
+            # Note: Audio mode is handled by the AUDIO-VIDEO PIPELINE section above
+            # The distilled LTX-2 model directly outputs X0 (denoised samples),
+            # NOT velocity. So we:
+            # 1. Get X0 directly from model
+            # 2. Apply CFG on X0 samples
+            # 3. Euler step with X0
+            # (output_shape already defined above for position creation)
 
-                # Create audio position grid (1D: time only)
-                audio_seq_len = f
-                audio_grid = mx.arange(audio_seq_len)[None, None, :]  # (1, 1, F)
-                audio_grid_start = audio_grid[..., None]
-                audio_grid_end = audio_grid_start + 1
-                audio_positions = mx.concatenate([audio_grid_start, audio_grid_end], axis=-1)  # (1, 1, F, 2)
+            # Apply CFG if enabled
+            if use_cfg:
+                if low_memory:
+                    # MEMORY OPTIMIZATION: Sequential CFG passes
+                    # Run unconditional first, eval, then conditional
 
-                # Create video modality for conditional pass
-                video_modality_cond = Modality(
-                    latent=latent_patchified,
-                    context=text_encoding,
-                    context_mask=text_mask,
-                    timesteps=mx.array([sigma]),
-                    positions=positions,
-                    enabled=True,
-                )
+                    # Unconditional (null text) pass first
+                    # NOTE: context_mask=None matches PyTorch behavior
+                    modality_uncond = Modality(
+                        latent=latent_patchified,
+                        context=null_encoding,
+                        context_mask=None,
+                        timesteps=mx.array([sigma]),
+                        positions=positions,
+                        enabled=True,
+                    )
+                    x0_uncond_patchified = model(modality_uncond)
+                    denoised_uncond = patchifier.unpatchify(x0_uncond_patchified, output_shape=output_shape)
+                    mx.eval(denoised_uncond)
+                    del x0_uncond_patchified
 
-                # Create audio modality for conditional pass
-                audio_modality_cond = Modality(
-                    latent=audio_latent_patchified,
-                    context=text_encoding,
-                    context_mask=text_mask,
-                    timesteps=mx.array([sigma]),
-                    positions=audio_positions,
-                    enabled=True,
-                )
-
-                # Run AudioVideo transformer (conditional)
-                video_velocity_cond_patchified, audio_velocity_cond_patchified = model(
-                    video_modality_cond, audio_modality_cond
-                )
-
-                # Unpatchify video velocity: [B, T, C] -> [B, C, F, H, W]
-                # (output_shape already defined above for position creation)
-                video_velocity_cond = patchifier.unpatchify(video_velocity_cond_patchified, output_shape=output_shape)
-
-                # Unpatchify audio velocity: [B, F, C*mel] -> [B, C, F, mel]
-                audio_velocity_cond = audio_velocity_cond_patchified.reshape(b, f, c, mel)  # (B, F, C, mel)
-                audio_velocity_cond = audio_velocity_cond.transpose(0, 2, 1, 3)  # (B, C, F, mel)
-
-                # Apply CFG if enabled
-                if use_cfg:
-                    if low_memory:
-                        # MEMORY OPTIMIZATION: Sequential CFG passes for AudioVideo
-                        # Run unconditional first, eval, then use cond results we already have
-
-                        # Unconditional pass
-                        video_modality_uncond = Modality(
-                            latent=latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        audio_modality_uncond = Modality(
-                            latent=audio_latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=audio_positions,
-                            enabled=True,
-                        )
-
-                        video_velocity_uncond_patchified, audio_velocity_uncond_patchified = model(
-                            video_modality_uncond, audio_modality_uncond
-                        )
-                        video_velocity_uncond = patchifier.unpatchify(video_velocity_uncond_patchified, output_shape=output_shape)
-                        audio_velocity_uncond = audio_velocity_uncond_patchified.reshape(b, f, c, mel)
-                        audio_velocity_uncond = audio_velocity_uncond.transpose(0, 2, 1, 3)
-                        mx.eval(video_velocity_uncond)
-                        mx.eval(audio_velocity_uncond)
-                        del video_velocity_uncond_patchified, audio_velocity_uncond_patchified
-
-                        # CFG formula for both
-                        velocity = video_velocity_uncond + cfg_scale * (video_velocity_cond - video_velocity_uncond)
-                        audio_velocity = audio_velocity_uncond + cfg_scale * (audio_velocity_cond - audio_velocity_uncond)
-                        del video_velocity_uncond, audio_velocity_uncond, video_velocity_cond, audio_velocity_cond
-                    else:
-                        # Standard CFG: parallel memory usage
-                        video_modality_uncond = Modality(
-                            latent=latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        audio_modality_uncond = Modality(
-                            latent=audio_latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=audio_positions,
-                            enabled=True,
-                        )
-
-                        video_velocity_uncond_patchified, audio_velocity_uncond_patchified = model(
-                            video_modality_uncond, audio_modality_uncond
-                        )
-                        video_velocity_uncond = patchifier.unpatchify(video_velocity_uncond_patchified, output_shape=output_shape)
-                        audio_velocity_uncond = audio_velocity_uncond_patchified.reshape(b, f, c, mel)
-                        audio_velocity_uncond = audio_velocity_uncond.transpose(0, 2, 1, 3)
-
-                        # CFG formula for both
-                        velocity = video_velocity_uncond + cfg_scale * (video_velocity_cond - video_velocity_uncond)
-                        audio_velocity = audio_velocity_uncond + cfg_scale * (audio_velocity_cond - audio_velocity_uncond)
-                else:
-                    velocity = video_velocity_cond
-                    audio_velocity = audio_velocity_cond
-
-                # Euler step for both video and audio
-                latent = euler_step(latent, velocity, sigma, sigma_next)
-                audio_latent = euler_step(audio_latent, audio_velocity, sigma, sigma_next)
-
-                mx.eval(latent)
-                mx.eval(audio_latent)
-
-            else:
-                # === Video-only mode with X0 prediction ===
-                # The distilled LTX-2 model directly outputs X0 (denoised samples),
-                # NOT velocity. So we:
-                # 1. Get X0 directly from model
-                # 2. Apply CFG on X0 samples
-                # 3. Euler step with X0
-                # (output_shape already defined above for position creation)
-
-                # Apply CFG if enabled
-                if use_cfg:
-                    if low_memory:
-                        # MEMORY OPTIMIZATION: Sequential CFG passes
-                        # Run unconditional first, eval, then conditional
-
-                        # Unconditional (null text) pass first
-                        modality_uncond = Modality(
-                            latent=latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        x0_uncond_patchified = model(modality_uncond)
-                        denoised_uncond = patchifier.unpatchify(x0_uncond_patchified, output_shape=output_shape)
-                        mx.eval(denoised_uncond)
-                        del x0_uncond_patchified
-
-                        # Conditional (text-guided) pass
-                        modality_cond = Modality(
-                            latent=latent_patchified,
-                            context=text_encoding,
-                            context_mask=text_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        x0_cond_patchified = model(modality_cond)
-                        denoised_cond = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
-                        mx.eval(denoised_cond)
-                        del x0_cond_patchified
-
-                        # Apply guidance: APG if enabled, otherwise standard CFG
-                        if apg_guider is not None and apg_guider.enabled():
-                            denoised = apg_guider.guide(denoised_cond, denoised_uncond)
-                        else:
-                            # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
-                            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
-
-                        # Apply guidance rescale to prevent variance explosion
-                        if guidance_rescale > 0:
-                            denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
-
-                        # Apply STG (Spatio-Temporal Guidance) if enabled
-                        if stg_guider is not None and stg_guider.enabled():
-                            # Run perturbed forward pass (skip video self-attention)
-                            x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
-                            denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
-                            denoised = stg_guider.guide(denoised, denoised_perturbed)
-                            del denoised_perturbed, x0_perturbed_patchified
-
-                        del denoised_uncond, denoised_cond
-                    else:
-                        # Standard CFG: Sequential forward passes
-                        # NOTE: Batched CFG (stacking cond+uncond) was tested but found SLOWER
-                        # for 19B models because GPU is already fully utilized with batch=1.
-                        # Doubling batch just doubles compute time with no throughput gain.
-                        modality_cond = Modality(
-                            latent=latent_patchified,
-                            context=text_encoding,
-                            context_mask=text_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        x0_cond_patchified = model(modality_cond)
-                        denoised_cond = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
-
-                        modality_uncond = Modality(
-                            latent=latent_patchified,
-                            context=null_encoding,
-                            context_mask=null_mask,
-                            timesteps=mx.array([sigma]),
-                            positions=positions,
-                            enabled=True,
-                        )
-                        x0_uncond_patchified = model(modality_uncond)
-                        denoised_uncond = patchifier.unpatchify(x0_uncond_patchified, output_shape=output_shape)
-
-                        # Apply guidance: APG if enabled, otherwise standard CFG
-                        if apg_guider is not None and apg_guider.enabled():
-                            denoised = apg_guider.guide(denoised_cond, denoised_uncond)
-                        else:
-                            # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
-                            denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
-
-                        # Apply guidance rescale to prevent variance explosion
-                        if guidance_rescale > 0:
-                            denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
-
-                        # Apply STG (Spatio-Temporal Guidance) if enabled
-                        if stg_guider is not None and stg_guider.enabled():
-                            # Run perturbed forward pass (skip video self-attention)
-                            x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
-                            denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
-                            denoised = stg_guider.guide(denoised, denoised_perturbed)
-                else:
-                    # No CFG - just conditional pass
+                    # Conditional (text-guided) pass
+                    # NOTE: context_mask=None matches PyTorch behavior
                     modality_cond = Modality(
                         latent=latent_patchified,
                         context=text_encoding,
-                        context_mask=text_mask,
+                        context_mask=None,
                         timesteps=mx.array([sigma]),
                         positions=positions,
                         enabled=True,
                     )
                     x0_cond_patchified = model(modality_cond)
-                    denoised = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
+                    denoised_cond = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
+                    mx.eval(denoised_cond)
+                    del x0_cond_patchified
 
-                    # Apply STG (Spatio-Temporal Guidance) if enabled (works without CFG)
+                    # Apply guidance: APG if enabled, otherwise standard CFG
+                    if apg_guider is not None and apg_guider.enabled():
+                        denoised = apg_guider.guide(denoised_cond, denoised_uncond)
+                    else:
+                        # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
+                        denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
+
+                    # Apply guidance rescale to prevent variance explosion
+                    if guidance_rescale > 0:
+                        denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
+
+                    # Apply STG (Spatio-Temporal Guidance) if enabled
                     if stg_guider is not None and stg_guider.enabled():
                         # Run perturbed forward pass (skip video self-attention)
-                        x0_perturbed_patchified = model(modality_cond, skip_video_self_attn=True)
+                        x0_perturbed_patchified = model(modality_cond, perturbations=create_batched_stg_config(batch_size=1))
                         denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
                         denoised = stg_guider.guide(denoised, denoised_perturbed)
+                        del denoised_perturbed, x0_perturbed_patchified
 
-                # Apply GE (Gradient Estimation) velocity correction if enabled
-                if ge_gamma > 0:
-                    # Compute current velocity: v = (x - x0) / sigma
-                    current_velocity = (latent - denoised) / sigma
+                    del denoised_uncond, denoised_cond
+                else:
+                    # Standard CFG: Sequential forward passes
+                    # NOTE: Batched CFG (stacking cond+uncond) was tested but found SLOWER
+                    # for 19B models because GPU is already fully utilized with batch=1.
+                    # Doubling batch just doubles compute time with no throughput gain.
+                    # NOTE: context_mask=None matches PyTorch behavior
+                    modality_cond = Modality(
+                        latent=latent_patchified,
+                        context=text_encoding,
+                        context_mask=None,
+                        timesteps=mx.array([sigma]),
+                        positions=positions,
+                        enabled=True,
+                    )
+                    x0_cond_patchified = model(modality_cond)
+                    denoised_cond = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
 
-                    if prev_velocity is not None:
-                        # Apply velocity correction using momentum-like update
-                        delta_v = current_velocity - prev_velocity
-                        total_velocity = ge_gamma * delta_v + prev_velocity
-                        # Reconstruct corrected denoised: x0 = x - v * sigma
-                        denoised = latent - total_velocity * sigma
+                    # NOTE: context_mask=None matches PyTorch behavior
+                    modality_uncond = Modality(
+                        latent=latent_patchified,
+                        context=null_encoding,
+                        context_mask=None,
+                        timesteps=mx.array([sigma]),
+                        positions=positions,
+                        enabled=True,
+                    )
+                    x0_uncond_patchified = model(modality_uncond)
+                    denoised_uncond = patchifier.unpatchify(x0_uncond_patchified, output_shape=output_shape)
 
-                    # Update velocity for next iteration
-                    prev_velocity = current_velocity
+                    # Apply guidance: APG if enabled, otherwise standard CFG
+                    if apg_guider is not None and apg_guider.enabled():
+                        denoised = apg_guider.guide(denoised_cond, denoised_uncond)
+                    else:
+                        # CFG formula on X0: x0 = x0_uncond + scale * (x0_cond - x0_uncond)
+                        denoised = denoised_uncond + cfg_scale * (denoised_cond - denoised_uncond)
 
-                # Euler step using X0 (denoised) prediction
-                latent = euler_step_x0(latent, denoised, sigma, sigma_next)
+                    # Apply guidance rescale to prevent variance explosion
+                    if guidance_rescale > 0:
+                        denoised = rescale_noise_cfg(denoised, denoised_cond, guidance_rescale)
 
-                # Force evaluation for memory efficiency
-                mx.eval(latent)
+                    # Apply STG (Spatio-Temporal Guidance) if enabled
+                    if stg_guider is not None and stg_guider.enabled():
+                        # Run perturbed forward pass (skip video self-attention)
+                        x0_perturbed_patchified = model(modality_cond, perturbations=create_batched_stg_config(batch_size=1))
+                        denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
+                        denoised = stg_guider.guide(denoised, denoised_perturbed)
+            else:
+                # No CFG - just conditional pass
+                # NOTE: context_mask=None matches PyTorch behavior
+                modality_cond = Modality(
+                    latent=latent_patchified,
+                    context=text_encoding,
+                    context_mask=None,
+                    timesteps=mx.array([sigma]),
+                    positions=positions,
+                    enabled=True,
+                )
+                x0_cond_patchified = model(modality_cond)
+                denoised = patchifier.unpatchify(x0_cond_patchified, output_shape=output_shape)
+
+                # Apply STG (Spatio-Temporal Guidance) if enabled (works without CFG)
+                if stg_guider is not None and stg_guider.enabled():
+                    # Run perturbed forward pass (skip video self-attention)
+                    x0_perturbed_patchified = model(modality_cond, perturbations=create_batched_stg_config(batch_size=1))
+                    denoised_perturbed = patchifier.unpatchify(x0_perturbed_patchified, output_shape=output_shape)
+                    denoised = stg_guider.guide(denoised, denoised_perturbed)
+
+            # Apply GE (Gradient Estimation) velocity correction if enabled
+            if ge_gamma > 0:
+                # Compute current velocity: v = (x - x0) / sigma
+                current_velocity = (latent - denoised) / sigma
+
+                if prev_velocity is not None:
+                    # Apply velocity correction using momentum-like update
+                    delta_v = current_velocity - prev_velocity
+                    total_velocity = ge_gamma * delta_v + prev_velocity
+                    # Reconstruct corrected denoised: x0 = x - v * sigma
+                    denoised = latent - total_velocity * sigma
+
+                # Update velocity for next iteration
+                prev_velocity = current_velocity
+
+            # Euler step using X0 (denoised) prediction
+            latent = euler_step_x0(latent, denoised, sigma, sigma_next)
+
+            # Force evaluation for memory efficiency
+            mx.eval(latent)
         else:
             # Placeholder: random velocity
             velocity = mx.random.normal(shape=latent.shape) * 0.1
             latent = euler_step(latent, velocity, sigma, sigma_next)
-
-            if generate_audio and audio_latent is not None:
-                audio_velocity = mx.random.normal(shape=audio_latent.shape) * 0.1
-                audio_latent = euler_step(audio_latent, audio_velocity, sigma, sigma_next)
-
             mx.eval(latent)
 
     # === MEMORY OPTIMIZATION ===
@@ -1472,13 +1557,8 @@ def generate_video(
     # Save denoised latent
     latent_path = output_path.replace('.mp4', '_latent.npz')
     print(f"\nSaving denoised latent to {latent_path}...")
-    if generate_audio and audio_latent is not None:
-        np.savez(latent_path, latent=np.array(latent), audio_latent=np.array(audio_latent))
-        print(f"  Video latent shape: {latent.shape}")
-        print(f"  Audio latent shape: {audio_latent.shape}")
-    else:
-        np.savez(latent_path, latent=np.array(latent))
-        print(f"  Latent shape: {latent.shape}")
+    np.savez(latent_path, latent=np.array(latent))
+    print(f"  Latent shape: {latent.shape}")
 
     # Apply spatial upscaling if requested
     if upscale_spatial and spatial_upscaler_weights:
@@ -1618,36 +1698,10 @@ def generate_video(
 
             frames.append(frame)
 
-    # Decode audio if generated
-    audio_waveform = None
-    if generate_audio and audio_latent is not None and audio_decoder is not None and vocoder is not None:
-        print("\nDecoding audio...")
-        print(f"  Audio latent: {audio_latent.shape}")
-
-        # Decode audio latent to mel spectrogram
-        # Audio latent: (B, 64, F, 16) -> mel: (B, 2, F*4, 64)
-        mel_spectrogram = audio_decoder(audio_latent)
-        mx.eval(mel_spectrogram)
-        print(f"  Mel spectrogram: {mel_spectrogram.shape}")
-
-        # Convert mel spectrogram to audio waveform with vocoder
-        # mel: (B, 2, T, 64) -> waveform: (B, 2, audio_samples)
-        audio_waveform = vocoder(mel_spectrogram)
-        mx.eval(audio_waveform)
-        print(f"  Audio waveform: {audio_waveform.shape}")
-
-        # Clear audio decoder and vocoder from memory
-        del audio_decoder
-        del vocoder
-        gc.collect()
-        mx.metal.clear_cache()
-
-    # Save as video (with or without audio)
+    # Save video
+    # Note: Audio generation is handled by the AUDIO-VIDEO PIPELINE section above
     print(f"\nSaving video to {output_path}...")
-    if audio_waveform is not None:
-        save_video_with_audio(frames, audio_waveform, output_path, fps=24)
-    else:
-        save_video(frames, output_path, fps=24)
+    save_video(frames, output_path, fps=24)
 
     print(f"\nDone! Video saved to {output_path}")
 
@@ -1782,7 +1836,7 @@ def main():
     parser.add_argument("--steps-stage2", type=int, default=3, help="Stage 2 refinement steps for two-stage pipeline")
     parser.add_argument("--cfg-stage1", type=float, default=None, help="Stage 1 CFG (defaults to --cfg value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--output", type=str, default="gens/output.mp4", help="Output path")
+    parser.add_argument("--output", type=str, default="outputs/output.mp4", help="Output path")
     parser.add_argument(
         "--weights",
         type=str,

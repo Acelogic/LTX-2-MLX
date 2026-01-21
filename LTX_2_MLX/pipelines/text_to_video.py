@@ -155,6 +155,8 @@ class TextToVideoPipeline:
         text_encoding: mx.array,
         text_mask: mx.array,
         cfg_scale: float,
+        negative_encoding: Optional[mx.array] = None,
+        negative_mask: Optional[mx.array] = None,
     ) -> Tuple[mx.array, mx.array]:
         """
         Prepare text context for CFG.
@@ -165,14 +167,27 @@ class TextToVideoPipeline:
             text_encoding: Encoded text [B, T, D].
             text_mask: Attention mask [B, T].
             cfg_scale: CFG scale.
+            negative_encoding: Optional pre-encoded negative prompt [B, T, D].
+                If None, uses zeros (less accurate than encoding empty string).
+            negative_mask: Optional attention mask for negative prompt [B, T].
+                If None and negative_encoding is provided, uses ones.
 
         Returns:
             Tuple of (doubled_encoding, doubled_mask) for CFG.
         """
         if cfg_scale > 1.0:
-            # Create unconditional context (zeros)
-            uncond = mx.zeros_like(text_encoding)
-            uncond_mask = mx.ones_like(text_mask)
+            # Use provided negative encoding or fall back to zeros
+            if negative_encoding is not None:
+                uncond = negative_encoding
+                uncond_mask = (
+                    negative_mask
+                    if negative_mask is not None
+                    else mx.ones((negative_encoding.shape[0], negative_encoding.shape[1]))
+                )
+            else:
+                # Fallback to zeros (less accurate than encoded empty string)
+                uncond = mx.zeros_like(text_encoding)
+                uncond_mask = mx.ones_like(text_mask)
 
             # Stack conditional and unconditional
             context = mx.concatenate([text_encoding, uncond], axis=0)
@@ -261,6 +276,8 @@ class TextToVideoPipeline:
         text_mask: mx.array,
         config: GenerationConfig,
         callback: Optional[Callable[[int, int, mx.array], None]] = None,
+        negative_encoding: Optional[mx.array] = None,
+        negative_mask: Optional[mx.array] = None,
     ) -> mx.array:
         """
         Generate video from text.
@@ -270,6 +287,10 @@ class TextToVideoPipeline:
             text_mask: Text attention mask [B, T].
             config: Generation configuration.
             callback: Optional callback(step, total_steps, latent).
+            negative_encoding: Optional pre-encoded negative prompt [B, T, D].
+                For best results, encode an empty string through the text encoder.
+                If None, falls back to zeros (matches OneStagePipeline behavior).
+            negative_mask: Optional attention mask for negative prompt [B, T].
 
         Returns:
             Generated video tensor [B, C, F, H, W] in pixel space.
@@ -288,7 +309,11 @@ class TextToVideoPipeline:
 
         # Prepare text context for CFG
         context, mask = self.prepare_text_context(
-            text_encoding, text_mask, config.cfg_scale
+            text_encoding,
+            text_mask,
+            config.cfg_scale,
+            negative_encoding=negative_encoding,
+            negative_mask=negative_mask,
         )
 
         # Create position grid

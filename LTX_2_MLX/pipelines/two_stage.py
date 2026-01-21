@@ -8,7 +8,7 @@ This combines the quality of CFG guidance with the speed of distilled refinement
 """
 
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 import mlx.core as mx
 
@@ -17,8 +17,8 @@ from .common import (
     apply_conditionings,
     create_image_conditionings,
     modality_from_state,
+    audio_modality_from_state,
     post_process_latent,
-    timesteps_from_mask,
 )
 from ..components import (
     CFGGuider,
@@ -28,15 +28,17 @@ from ..components import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     VideoLatentPatchifier,
 )
-from ..conditioning.item import ConditioningItem
-from ..conditioning.tools import VideoLatentTools
+from ..components.patchifiers import AudioPatchifier
+from ..conditioning.tools import VideoLatentTools, AudioLatentTools
 from ..loader import LoRAConfig, fuse_lora_into_weights
 from ..model.transformer import LTXModel, Modality, X0Model
 from ..model.video_vae.simple_decoder import SimpleVideoDecoder, decode_latent
 from ..model.video_vae.simple_encoder import SimpleVideoEncoder
 from ..model.video_vae.tiling import TilingConfig, decode_tiled
 from ..model.upscaler import SpatialUpscaler
+from ..model.audio_vae import AudioDecoder, Vocoder
 from ..types import (
+    AudioLatentShape,
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
@@ -68,6 +70,15 @@ class TwoStageCFGConfig:
 
     # Compute settings
     dtype: mx.Dtype = mx.float32
+
+    # Audio configuration
+    audio_enabled: bool = False
+    audio_vae_channels: int = 8
+    audio_mel_bins: int = 16
+    audio_sample_rate: int = 16000
+    audio_hop_length: int = 160
+    audio_downsample_factor: int = 4
+    audio_output_sample_rate: int = 24000
 
     def __post_init__(self):
         if self.num_frames % 8 != 1:
@@ -103,6 +114,8 @@ class TwoStagePipeline:
         video_encoder: SimpleVideoEncoder,
         video_decoder: SimpleVideoDecoder,
         spatial_upscaler: SpatialUpscaler,
+        audio_decoder: Optional[AudioDecoder] = None,
+        vocoder: Optional[Vocoder] = None,
     ):
         """
         Initialize the two-stage pipeline.
@@ -112,6 +125,8 @@ class TwoStagePipeline:
             video_encoder: VAE encoder for encoding images.
             video_decoder: VAE decoder for decoding latents to video.
             spatial_upscaler: 2x spatial upscaler for stage 2.
+            audio_decoder: Optional audio VAE decoder for decoding audio latents to mel spectrograms.
+            vocoder: Optional vocoder for converting mel spectrograms to waveforms.
         """
         # Store raw velocity model for LoRA operations
         if isinstance(transformer, X0Model):
@@ -124,7 +139,10 @@ class TwoStagePipeline:
         self.video_encoder = video_encoder
         self.video_decoder = video_decoder
         self.spatial_upscaler = spatial_upscaler
+        self.audio_decoder = audio_decoder
+        self.vocoder = vocoder
         self.patchifier = VideoLatentPatchifier(patch_size=1)
+        self.audio_patchifier = AudioPatchifier(patch_size=1)
         self.diffusion_step = EulerDiffusionStep()
         self.scheduler = LTX2Scheduler()
 
@@ -143,14 +161,45 @@ class TwoStagePipeline:
             fps=fps,
         )
 
+    def _create_audio_tools(
+        self,
+        target_shape: AudioLatentShape,
+    ) -> AudioLatentTools:
+        """Create audio latent tools for the target shape."""
+        return AudioLatentTools(
+            patchifier=self.audio_patchifier,
+            target_shape=target_shape,
+        )
+
+    def _decode_audio(self, audio_latent: mx.array) -> mx.array:
+        """
+        Decode audio latent to waveform via VAE decoder + vocoder.
+
+        Args:
+            audio_latent: Audio latent tensor [B, C, F, mel_bins].
+
+        Returns:
+            Audio waveform tensor [B, channels, samples].
+        """
+        if self.audio_decoder is None or self.vocoder is None:
+            raise ValueError("Audio decoder and vocoder required for audio decoding")
+
+        # Decode latent to mel spectrogram
+        mel_spectrogram = self.audio_decoder(audio_latent)
+        mx.eval(mel_spectrogram)
+
+        # Convert mel spectrogram to waveform
+        waveform = self.vocoder(mel_spectrogram)
+        mx.eval(waveform)
+
+        return waveform
+
     def _denoise_loop_cfg(
         self,
         video_state: LatentState,
         sigmas: mx.array,
         positive_context: mx.array,
-        positive_mask: mx.array,
         negative_context: mx.array,
-        negative_mask: mx.array,
         guider: CFGGuider,
         stepper: EulerDiffusionStep,
         callback: Optional[Callable[[str, int, int], None]] = None,
@@ -163,14 +212,14 @@ class TwoStagePipeline:
 
             # Run positive (conditioned) prediction
             pos_modality = modality_from_state(
-                video_state, positive_context, positive_mask, sigma
+                video_state, positive_context, sigma
             )
             pos_denoised = self.transformer(pos_modality)
 
             # Run negative (unconditioned) prediction for CFG
             if guider.enabled():
                 neg_modality = modality_from_state(
-                    video_state, negative_context, negative_mask, sigma
+                    video_state, negative_context, sigma
                 )
                 neg_denoised = self.transformer(neg_modality)
 
@@ -199,12 +248,113 @@ class TwoStagePipeline:
 
         return video_state
 
+    def _denoise_loop_cfg_av(
+        self,
+        video_state: LatentState,
+        audio_state: LatentState,
+        sigmas: mx.array,
+        positive_video_context: mx.array,
+        negative_video_context: mx.array,
+        positive_audio_context: mx.array,
+        negative_audio_context: mx.array,
+        guider: CFGGuider,
+        stepper: EulerDiffusionStep,
+        callback: Optional[Callable[[str, int, int], None]] = None,
+    ) -> Tuple[LatentState, LatentState]:
+        """
+        Run joint audio-video denoising loop with CFG guidance (Stage 1).
+
+        Args:
+            video_state: Initial noisy video latent state.
+            audio_state: Initial noisy audio latent state.
+            sigmas: Sigma schedule.
+            positive_video_context: Positive text context for video.
+            negative_video_context: Negative text context for video.
+            positive_audio_context: Positive text context for audio.
+            negative_audio_context: Negative text context for audio.
+            guider: CFG guider instance.
+            stepper: Diffusion stepper.
+            callback: Optional callback(stage, step, total_steps).
+
+        Returns:
+            Tuple of (denoised_video_state, denoised_audio_state).
+        """
+        num_steps = len(sigmas) - 1
+
+        for step_idx in range(num_steps):
+            sigma = float(sigmas[step_idx])
+
+            # Create positive (conditioned) modalities
+            pos_video_modality = modality_from_state(
+                video_state, positive_video_context, sigma
+            )
+            pos_audio_modality = audio_modality_from_state(
+                audio_state, positive_audio_context, sigma
+            )
+
+            # Run joint forward pass (conditioned)
+            pos_video_denoised, pos_audio_denoised = self.transformer(
+                pos_video_modality, pos_audio_modality
+            )
+
+            # Run negative (unconditioned) prediction for CFG
+            if guider.enabled():
+                neg_video_modality = modality_from_state(
+                    video_state, negative_video_context, sigma
+                )
+                neg_audio_modality = audio_modality_from_state(
+                    audio_state, negative_audio_context, sigma
+                )
+
+                neg_video_denoised, neg_audio_denoised = self.transformer(
+                    neg_video_modality, neg_audio_modality
+                )
+
+                # Apply CFG guidance to both modalities
+                video_denoised = guider.guide(pos_video_denoised, neg_video_denoised)
+                audio_denoised = guider.guide(pos_audio_denoised, neg_audio_denoised)
+            else:
+                video_denoised = pos_video_denoised
+                audio_denoised = pos_audio_denoised
+
+            # Post-process with denoise mask
+            video_denoised = post_process_latent(
+                video_denoised, video_state.denoise_mask, video_state.clean_latent
+            )
+            audio_denoised = post_process_latent(
+                audio_denoised, audio_state.denoise_mask, audio_state.clean_latent
+            )
+
+            # Euler step for both modalities
+            new_video_latent = stepper.step(
+                sample=video_state.latent,
+                denoised_sample=video_denoised,
+                sigmas=sigmas,
+                step_index=step_idx,
+            )
+            new_audio_latent = stepper.step(
+                sample=audio_state.latent,
+                denoised_sample=audio_denoised,
+                sigmas=sigmas,
+                step_index=step_idx,
+            )
+
+            video_state = video_state.replace(latent=new_video_latent)
+            audio_state = audio_state.replace(latent=new_audio_latent)
+
+            mx.eval(video_state.latent)
+            mx.eval(audio_state.latent)
+
+            if callback:
+                callback("stage1", step_idx + 1, num_steps)
+
+        return video_state, audio_state
+
     def _denoise_loop_simple(
         self,
         video_state: LatentState,
         sigmas: mx.array,
         context: mx.array,
-        context_mask: mx.array,
         stepper: EulerDiffusionStep,
         callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> LatentState:
@@ -215,7 +365,7 @@ class TwoStagePipeline:
             sigma = float(sigmas[step_idx])
 
             # Simple denoising - only positive context
-            modality = modality_from_state(video_state, context, context_mask, sigma)
+            modality = modality_from_state(video_state, context, sigma)
             denoised = self.transformer(modality)
 
             # Post-process with denoise mask
@@ -238,32 +388,103 @@ class TwoStagePipeline:
 
         return video_state
 
+    def _denoise_loop_simple_av(
+        self,
+        video_state: LatentState,
+        audio_state: LatentState,
+        sigmas: mx.array,
+        video_context: mx.array,
+        audio_context: mx.array,
+        stepper: EulerDiffusionStep,
+        callback: Optional[Callable[[str, int, int], None]] = None,
+    ) -> Tuple[LatentState, LatentState]:
+        """Run simple joint audio-video denoising loop without CFG (Stage 2)."""
+        num_steps = len(sigmas) - 1
+
+        for step_idx in range(num_steps):
+            sigma = float(sigmas[step_idx])
+
+            # Simple denoising - only positive context
+            video_modality = modality_from_state(video_state, video_context, sigma)
+            audio_modality = audio_modality_from_state(audio_state, audio_context, sigma)
+            video_denoised, audio_denoised = self.transformer(video_modality, audio_modality)
+
+            # Post-process with denoise mask
+            video_denoised = post_process_latent(
+                video_denoised, video_state.denoise_mask, video_state.clean_latent
+            )
+            audio_denoised = post_process_latent(
+                audio_denoised, audio_state.denoise_mask, audio_state.clean_latent
+            )
+
+            # Euler step for both modalities
+            new_video_latent = stepper.step(
+                sample=video_state.latent,
+                denoised_sample=video_denoised,
+                sigmas=sigmas,
+                step_index=step_idx,
+            )
+            new_audio_latent = stepper.step(
+                sample=audio_state.latent,
+                denoised_sample=audio_denoised,
+                sigmas=sigmas,
+                step_index=step_idx,
+            )
+
+            video_state = video_state.replace(latent=new_video_latent)
+            audio_state = audio_state.replace(latent=new_audio_latent)
+
+            mx.eval(video_state.latent)
+            mx.eval(audio_state.latent)
+
+            if callback:
+                callback("stage2", step_idx + 1, num_steps)
+
+        return video_state, audio_state
+
     def __call__(
         self,
         positive_encoding: mx.array,
-        positive_mask: mx.array,
         negative_encoding: mx.array,
-        negative_mask: mx.array,
         config: TwoStageCFGConfig,
         images: Optional[List[ImageCondition]] = None,
         callback: Optional[Callable[[str, int, int], None]] = None,
-    ) -> mx.array:
+        positive_audio_encoding: Optional[mx.array] = None,
+        negative_audio_encoding: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, Optional[mx.array]]:
         """
-        Generate video using two-stage CFG pipeline.
+        Generate video (and optionally audio) using two-stage CFG pipeline.
 
         Args:
-            positive_encoding: Encoded positive prompt [B, T, D].
-            positive_mask: Positive text attention mask [B, T].
-            negative_encoding: Encoded negative prompt [B, T, D].
-            negative_mask: Negative text attention mask [B, T].
+            positive_encoding: Encoded positive prompt for video [B, T, D].
+            negative_encoding: Encoded negative prompt for video [B, T, D].
             config: Pipeline configuration.
             images: Optional list of image conditions.
             callback: Optional callback(stage, step, total_steps).
+            positive_audio_encoding: Encoded positive prompt for audio [B, T, D].
+                Required when config.audio_enabled is True.
+            negative_audio_encoding: Encoded negative prompt for audio [B, T, D].
+                Required when config.audio_enabled is True.
 
         Returns:
-            Generated video tensor [F, H, W, C] in pixel space (0-255).
+            Tuple of (video, audio) where:
+                - video: Generated video tensor [F, H, W, C] in pixel space (0-255).
+                - audio: Audio waveform [B, channels, samples] at output_sample_rate,
+                         or None if audio_enabled is False.
         """
         images = images or []
+
+        # Validate audio parameters
+        if config.audio_enabled:
+            if positive_audio_encoding is None or negative_audio_encoding is None:
+                raise ValueError(
+                    "Audio encoding required when audio_enabled is True. "
+                    "Provide positive_audio_encoding and negative_audio_encoding."
+                )
+            if self.audio_decoder is None or self.vocoder is None:
+                raise ValueError(
+                    "Audio decoder and vocoder required when audio_enabled is True."
+                )
 
         # Set seed
         mx.random.seed(config.seed)
@@ -301,45 +522,79 @@ class TwoStagePipeline:
             config.dtype,
         )
 
-        # Create initial state
+        # Create initial video state
         video_state = video_tools.create_initial_state(dtype=config.dtype)
 
         # Apply conditionings
         video_state = apply_conditionings(video_state, stage_1_conditionings, video_tools)
 
         # Get stage 1 sigmas using LTX2Scheduler
-        sigmas = self.scheduler.execute(
-            steps=config.num_inference_steps,
-            latent=video_state.latent,
-        )
+        sigmas = self.scheduler.execute(steps=config.num_inference_steps)
 
-        # Add noise
+        # Add noise to video
         video_state = noiser(video_state, noise_scale=1.0)
 
-        # Run stage 1 denoising with CFG
-        video_state = self._denoise_loop_cfg(
-            video_state=video_state,
-            sigmas=sigmas,
-            positive_context=positive_encoding,
-            positive_mask=positive_mask,
-            negative_context=negative_encoding,
-            negative_mask=negative_mask,
-            guider=guider,
-            stepper=stepper,
-            callback=callback,
-        )
+        # Handle audio if enabled
+        audio_state = None
+        audio_tools = None
+        if config.audio_enabled:
+            # Create audio latent shape from video duration
+            audio_shape = AudioLatentShape.from_video_pixel_shape(
+                stage_1_pixel_shape,
+                channels=config.audio_vae_channels,
+                mel_bins=config.audio_mel_bins,
+                sample_rate=config.audio_sample_rate,
+                hop_length=config.audio_hop_length,
+                audio_latent_downsample_factor=config.audio_downsample_factor,
+            )
+            audio_tools = self._create_audio_tools(audio_shape)
+            audio_state = audio_tools.create_initial_state(dtype=config.dtype)
+            audio_state = noiser(audio_state, noise_scale=1.0)
+
+        # Run stage 1 denoising
+        if config.audio_enabled and audio_state is not None:
+            # Joint audio-video denoising with CFG
+            video_state, audio_state = self._denoise_loop_cfg_av(
+                video_state=video_state,
+                audio_state=audio_state,
+                sigmas=sigmas,
+                positive_video_context=positive_encoding,
+                negative_video_context=negative_encoding,
+                positive_audio_context=positive_audio_encoding,
+                negative_audio_context=negative_audio_encoding,
+                guider=guider,
+                stepper=stepper,
+                callback=callback,
+            )
+        else:
+            # Video-only denoising with CFG
+            video_state = self._denoise_loop_cfg(
+                video_state=video_state,
+                sigmas=sigmas,
+                positive_context=positive_encoding,
+                negative_context=negative_encoding,
+                guider=guider,
+                stepper=stepper,
+                callback=callback,
+            )
 
         # Clear conditioning and unpatchify
         video_state = video_tools.clear_conditioning(video_state)
         video_state = video_tools.unpatchify(video_state)
 
-        stage_1_latent = video_state.latent
+        stage_1_video_latent = video_state.latent
+        stage_1_audio_latent = None
+        if config.audio_enabled and audio_state is not None and audio_tools is not None:
+            audio_state = audio_tools.clear_conditioning(audio_state)
+            audio_state = audio_tools.unpatchify(audio_state)
+            stage_1_audio_latent = audio_state.latent
 
-        # ====== STAGE 2: Upsample and refine with distilled LoRA ======
-        # Upsample the latent 2x
+        # ====== STAGE 2: Upsample video and refine with distilled LoRA ======
+        # Note: Audio doesn't need spatial upscaling, but we still refine it with video
+        # Upsample the video latent 2x
         # CRITICAL: Must un-normalize before upsampling, then re-normalize after
         # This is required by the PyTorch reference implementation to preserve latent distribution
-        latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_latent)
+        latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_video_latent)
 
         # Use nearest neighbor upsampling (vectorized for performance)
         # Vectorized implementation: ~2-3x faster than frame-by-frame loop
@@ -363,7 +618,7 @@ class TwoStagePipeline:
         upscaled_unnorm = upscaled_flat.transpose(0, 2, 1, 3, 4)  # (B, C, F, H*2, W*2)
 
         # Re-normalize back to latent space
-        upscaled_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
+        upscaled_video_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
 
         # Apply distilled LoRA if provided
         if config.distilled_lora_config is not None:
@@ -390,12 +645,12 @@ class TwoStagePipeline:
             width=config.width,
             fps=config.fps,
         )
-        stage_2_latent_shape = VideoLatentShape.from_pixel_shape(
+        stage_2_video_latent_shape = VideoLatentShape.from_pixel_shape(
             stage_2_pixel_shape, latent_channels=128
         )
 
         # Create video tools for stage 2
-        video_tools_2 = self._create_video_tools(stage_2_latent_shape, config.fps)
+        video_tools_2 = self._create_video_tools(stage_2_video_latent_shape, config.fps)
 
         # Create conditionings at full resolution
         stage_2_conditionings = create_image_conditionings(
@@ -406,9 +661,9 @@ class TwoStagePipeline:
             config.dtype,
         )
 
-        # Create initial state from upscaled latent
+        # Create initial video state from upscaled latent
         video_state_2 = video_tools_2.create_initial_state(
-            dtype=config.dtype, initial_latent=upscaled_latent
+            dtype=config.dtype, initial_latent=upscaled_video_latent
         )
 
         # Apply conditionings
@@ -422,15 +677,46 @@ class TwoStagePipeline:
         # Add noise at lower scale for refinement
         video_state_2 = noiser(video_state_2, noise_scale=float(distilled_sigmas[0]))
 
+        # Handle audio for stage 2
+        audio_state_2 = None
+        audio_tools_2 = None
+        if config.audio_enabled and stage_1_audio_latent is not None:
+            # Create audio tools for stage 2 (same shape as stage 1 - no spatial upscaling for audio)
+            audio_shape_2 = AudioLatentShape.from_video_pixel_shape(
+                stage_2_pixel_shape,
+                channels=config.audio_vae_channels,
+                mel_bins=config.audio_mel_bins,
+                sample_rate=config.audio_sample_rate,
+                hop_length=config.audio_hop_length,
+                audio_latent_downsample_factor=config.audio_downsample_factor,
+            )
+            audio_tools_2 = self._create_audio_tools(audio_shape_2)
+            audio_state_2 = audio_tools_2.create_initial_state(
+                dtype=config.dtype, initial_latent=stage_1_audio_latent
+            )
+            audio_state_2 = noiser(audio_state_2, noise_scale=float(distilled_sigmas[0]))
+
         # Run stage 2 denoising (simple, no CFG)
-        video_state_2 = self._denoise_loop_simple(
-            video_state=video_state_2,
-            sigmas=distilled_sigmas,
-            context=positive_encoding,
-            context_mask=positive_mask,
-            stepper=stepper,
-            callback=callback,
-        )
+        if config.audio_enabled and audio_state_2 is not None:
+            # Joint audio-video refinement
+            video_state_2, audio_state_2 = self._denoise_loop_simple_av(
+                video_state=video_state_2,
+                audio_state=audio_state_2,
+                sigmas=distilled_sigmas,
+                video_context=positive_encoding,
+                audio_context=positive_audio_encoding,
+                stepper=stepper,
+                callback=callback,
+            )
+        else:
+            # Video-only refinement
+            video_state_2 = self._denoise_loop_simple(
+                video_state=video_state_2,
+                sigmas=distilled_sigmas,
+                context=positive_encoding,
+                stepper=stepper,
+                callback=callback,
+            )
 
         # Restore original weights if LoRA was applied (use raw velocity model)
         if config.distilled_lora_config is not None and self._original_weights is not None:
@@ -442,15 +728,23 @@ class TwoStagePipeline:
         video_state_2 = video_tools_2.clear_conditioning(video_state_2)
         video_state_2 = video_tools_2.unpatchify(video_state_2)
 
-        final_latent = video_state_2.latent
+        final_video_latent = video_state_2.latent
 
         # Decode to video
         if config.tiling_config:
-            video = decode_tiled(final_latent, self.video_decoder, config.tiling_config)
+            video = decode_tiled(final_video_latent, self.video_decoder, config.tiling_config)
         else:
-            video = decode_latent(final_latent, self.video_decoder)
+            video = decode_latent(final_video_latent, self.video_decoder)
 
-        return video
+        # Decode audio if enabled
+        audio_waveform = None
+        if config.audio_enabled and audio_state_2 is not None and audio_tools_2 is not None:
+            audio_state_2 = audio_tools_2.clear_conditioning(audio_state_2)
+            audio_state_2 = audio_tools_2.unpatchify(audio_state_2)
+            final_audio_latent = audio_state_2.latent
+            audio_waveform = self._decode_audio(final_audio_latent)
+
+        return video, audio_waveform
 
 
 def create_two_stage_pipeline(
@@ -458,6 +752,8 @@ def create_two_stage_pipeline(
     video_encoder: SimpleVideoEncoder,
     video_decoder: SimpleVideoDecoder,
     spatial_upscaler: SpatialUpscaler,
+    audio_decoder: Optional[AudioDecoder] = None,
+    vocoder: Optional[Vocoder] = None,
 ) -> TwoStagePipeline:
     """
     Create a two-stage CFG pipeline.
@@ -467,6 +763,8 @@ def create_two_stage_pipeline(
         video_encoder: VAE encoder.
         video_decoder: VAE decoder.
         spatial_upscaler: 2x spatial upscaler.
+        audio_decoder: Optional audio VAE decoder (required for audio generation).
+        vocoder: Optional vocoder (required for audio generation).
 
     Returns:
         Configured TwoStagePipeline.
@@ -476,4 +774,6 @@ def create_two_stage_pipeline(
         video_encoder=video_encoder,
         video_decoder=video_decoder,
         spatial_upscaler=spatial_upscaler,
+        audio_decoder=audio_decoder,
+        vocoder=vocoder,
     )

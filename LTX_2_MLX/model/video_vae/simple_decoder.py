@@ -102,9 +102,19 @@ class Conv3dSimple(nn.Module):
         p = self.padding
         k = self.kernel_size
 
-        # Spatial padding (p on each side)
+        # Spatial padding with reflect mode (matches PyTorch decoder_spatial_padding_mode=REFLECT)
         if p > 0:
-            x = mx.pad(x, [(0, 0), (0, 0), (0, 0), (p, p), (p, p)])
+            # MLX doesn't have native reflect padding, so we implement it manually
+            # Reflect padding mirrors the edge pixels: [1,2,3] with pad=2 -> [3,2,1,2,3,2,1]
+            # For spatial dimensions (H and W)
+            # Pad height (dim 3)
+            h_pad_top = x[:, :, :, 1:p+1, :][:, :, :, ::-1, :]  # Reflect top edge
+            h_pad_bot = x[:, :, :, -(p+1):-1, :][:, :, :, ::-1, :]  # Reflect bottom edge
+            x = mx.concatenate([h_pad_top, x, h_pad_bot], axis=3)
+            # Pad width (dim 4)
+            w_pad_left = x[:, :, :, :, 1:p+1][:, :, :, :, ::-1]  # Reflect left edge
+            w_pad_right = x[:, :, :, :, -(p+1):-1][:, :, :, :, ::-1]  # Reflect right edge
+            x = mx.concatenate([w_pad_left, x, w_pad_right], axis=4)
 
         # Temporal padding: need k-1 total padding to preserve temporal dim
         t_pad_needed = k - 1
@@ -113,10 +123,15 @@ class Conv3dSimple(nn.Module):
             first_frames = mx.repeat(x[:, :, :1], t_pad_needed, axis=2)
             x = mx.concatenate([first_frames, x], axis=2)
         elif t_pad_needed > 0:
-            # Non-causal: symmetric padding
+            # Non-causal: symmetric padding using frame replication (NOT zero padding)
+            # This matches PyTorch CausalConv3d behavior
             pad_before = t_pad_needed // 2
             pad_after = t_pad_needed - pad_before
-            x = mx.pad(x, [(0, 0), (0, 0), (pad_before, pad_after), (0, 0), (0, 0)])
+            # Replicate first frame for padding at start
+            first_frames = mx.repeat(x[:, :, :1], pad_before, axis=2)
+            # Replicate last frame for padding at end
+            last_frames = mx.repeat(x[:, :, -1:], pad_after, axis=2)
+            x = mx.concatenate([first_frames, x, last_frames], axis=2)
 
         _, _, t_pad, h_pad, w_pad = x.shape
 
@@ -272,7 +287,12 @@ class DepthToSpaceUpsample3d(nn.Module):
         return x
 
     def __call__(self, x: mx.array, causal: bool = True) -> mx.array:
-        """Upsample via conv then depth-to-space with optional residual."""
+        """Upsample via conv then depth-to-space with optional residual.
+
+        Note: Frame trimming (removing first frame after d2s) happens unconditionally
+        when temporal factor > 1, matching PyTorch behavior. The causal parameter
+        only affects the conv layer padding style.
+        """
         ft, fh, fw = self.factor
         factor_product = ft * fh * fw
 
@@ -291,22 +311,27 @@ class DepthToSpaceUpsample3d(nn.Module):
             # Apply depth-to-space to input
             residual = self._depth_to_space(x, c_d2s)
 
-            # Trim first (ft-1) frames for causal consistency
-            if ft > 1 and causal:
-                residual = residual[:, :, ft - 1:]
+            # Trim first frame UNCONDITIONALLY when temporal factor > 1
+            # This matches PyTorch: x_in = x_in[:, :, 1:, :, :] when stride[0] == 2
+            if ft > 1:
+                residual = residual[:, :, 1:]
 
-            # Repeat channels to match out_channels
+            # Tile channels to match out_channels (PyTorch uses tensor.repeat which tiles)
             # num_repeat = factor_product // upscale_factor = 8 // 2 = 4
+            # PyTorch repeat(1,4,1,1,1) tiles: [C0,C1,...,Cn, C0,C1,...,Cn, ...]
+            # mx.repeat interleaves: [C0,C0,C0,C0, C1,C1,C1,C1, ...]
+            # We need tile behavior, so use mx.tile
             num_repeat = factor_product // self.upscale_factor
-            residual = mx.repeat(residual, num_repeat, axis=1)
+            residual = mx.tile(residual, (1, num_repeat, 1, 1, 1))
 
         # Main path: conv then d2s
         x = self.conv(x, causal=causal)
         x = self._depth_to_space(x, self.out_channels)
 
-        # Trim first (ft-1) frames for causal consistency
-        if ft > 1 and causal:
-            x = x[:, :, ft - 1:]
+        # Trim first frame UNCONDITIONALLY when temporal factor > 1
+        # This matches PyTorch: x = x[:, :, 1:, :, :] when stride[0] == 2
+        if ft > 1:
+            x = x[:, :, 1:]
 
         # Add residual
         if self.residual:
@@ -390,6 +415,10 @@ class SimpleVideoDecoder(nn.Module):
         # Timestep conditioning
         self.timestep_scale_multiplier = mx.array(1000.0)
 
+        # Noise injection scale (matches PyTorch VAE decoder behavior)
+        # When timestep conditioning is enabled, noise is mixed with the latent
+        self.decode_noise_scale = 0.025
+
         # Conv in: 128 -> 1024
         self.conv_in = Conv3dSimple(128, 1024)
 
@@ -418,6 +447,7 @@ class SimpleVideoDecoder(nn.Module):
         latent: mx.array,
         timestep: Optional[float] = 0.05,
         show_progress: bool = True,
+        causal: bool = False,
     ) -> mx.array:
         """
         Decode latent to video.
@@ -427,6 +457,8 @@ class SimpleVideoDecoder(nn.Module):
             timestep: Timestep for conditioning (default 0.05 for denoising).
                       Use 0.0 for no denoising, None to disable timestep conditioning.
             show_progress: Whether to show progress bar.
+            causal: Whether to use causal (past-only) temporal convolutions.
+                    Default False matches PyTorch VAE behavior.
 
         Returns:
             Video tensor (B, 3, T*8, H*32, W*32).
@@ -453,7 +485,7 @@ class SimpleVideoDecoder(nn.Module):
 
         def step_res(x, block, desc):
             nonlocal pbar
-            x = block(x, causal=True, timestep=scaled_timestep)
+            x = block(x, causal=causal, timestep=scaled_timestep)
             mx.eval(x)
             if has_tqdm and pbar is not None:
                 pbar.update(1)
@@ -462,7 +494,7 @@ class SimpleVideoDecoder(nn.Module):
 
         def step_up(x, block, desc):
             nonlocal pbar
-            x = block(x, causal=True)
+            x = block(x, causal=causal)
             mx.eval(x)
             if has_tqdm and pbar is not None:
                 pbar.update(1)
@@ -476,8 +508,14 @@ class SimpleVideoDecoder(nn.Module):
         x = latent * self.std_of_means[None, :, None, None, None]
         x = x + self.mean_of_means[None, :, None, None, None]
 
+        # Noise injection when timestep conditioning is enabled (matches PyTorch)
+        # This helps the decoder handle residual noise in the latent space
+        if timestep is not None:
+            noise = mx.random.normal(x.shape) * self.decode_noise_scale
+            x = noise + (1.0 - self.decode_noise_scale) * x
+
         # Conv in
-        x = self.conv_in(x, causal=True)
+        x = self.conv_in(x, causal=causal)
         mx.eval(x)
         if has_tqdm and pbar is not None:
             pbar.update(1)
@@ -517,7 +555,7 @@ class SimpleVideoDecoder(nn.Module):
         x = nn.silu(x)
 
         # Conv out
-        x = self.conv_out(x, causal=True)
+        x = self.conv_out(x, causal=causal)
         mx.eval(x)
         if has_tqdm and pbar is not None:
             pbar.update(1)

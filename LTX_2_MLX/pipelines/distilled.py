@@ -157,7 +157,7 @@ class DistilledPipeline:
 
             # Create modality (simple denoising - only positive context)
             modality = modality_from_state(
-                video_state, context, context_mask, sigma
+                video_state, context, sigma
             )
 
             # Run model - direct denoising without CFG

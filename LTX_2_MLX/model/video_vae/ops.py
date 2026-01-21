@@ -43,17 +43,20 @@ def patchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.array
 
     elif x.ndim == 5:
         # 5D: (B, C, F, H, W) -> (B, C*p*q*r, F/p, H/q, W/r)
+        # PyTorch einops: "b c (f p) (h q) (w r) -> b (c p r q) f h w"
+        # Channel packing order: (c, p, r_w, r_h) to match PyTorch
         b, c, f, h, w = x.shape
         p = patch_size_t
         q = patch_size_hw  # r_h (height factor)
         r = patch_size_hw  # r_w (width factor)
 
         # Reshape: (B, C, F, H, W) -> (B, C, F/p, p, H/q, q, W/r, r)
+        # Indices:                     0   1   2    3   4    5   6    7
         x = x.reshape(b, c, f // p, p, h // q, q, w // r, r)
-        # Transpose: -> (B, C, p, q, r, F/p, H/q, W/r)
-        # Pack channels as (C, p, r_h, r_w) to match unpatchify
-        x = x.transpose(0, 1, 3, 5, 7, 2, 4, 6)
-        # Reshape: -> (B, C*p*q*r, F/p, H/q, W/r)
+        # Transpose: -> (B, C, p, r_w, r_h, F/p, H/q, W/r)
+        # Pack channels as (C, p, r_w, r_h) matching PyTorch einops order
+        x = x.transpose(0, 1, 3, 7, 5, 2, 4, 6)
+        # Reshape: -> (B, C*p*r*q, F/p, H/q, W/r)
         x = x.reshape(b, c * p * q * r, f // p, h // q, w // r)
 
     else:
@@ -105,18 +108,20 @@ def unpatchify(x: mx.array, patch_size_hw: int, patch_size_t: int = 1) -> mx.arr
     elif x.ndim == 5:
         # 5D: (B, C*p*r*r, F, H, W) -> (B, C, F*p, H*r, W*r)
         # PyTorch einops: "b (c p r q) f h w -> b c (f p) (h q) (w r)"
-        # Channel packing order: (c, p, r_w, r_h) with r_w for width, r_h for height
+        # Channel packing order: (c, p, r_w, r_h) where r=r_w (width), q=r_h (height)
+        # This matches the patchify output order for round-trip consistency
         b, c_packed, f, h, w = x.shape
         p = patch_size_t
-        r = patch_size_hw
+        r = patch_size_hw  # Used for both r_w and r_h (square patches)
         c = c_packed // (p * r * r)
 
         # Reshape: (B, C*p*r*r, F, H, W) -> (B, C, p, r_w, r_h, F, H, W)
+        # Indices:                          0   1  2   3    4   5  6  7
         x = x.reshape(b, c, p, r, r, f, h, w)
         # Transpose: -> (B, C, F, p, H, r_h, W, r_w)
-        # Swap positions 3<->4 compared to naive (0,1,5,2,6,3,7,4) to match PyTorch
+        # Maps: 0->0, 1->1, 5->2, 2->3, 6->4, 4->5, 7->6, 3->7
         x = x.transpose(0, 1, 5, 2, 6, 4, 7, 3)
-        # Reshape: -> (B, C, F*p, H*r, W*r)
+        # Reshape: -> (B, C, F*p, H*r_h, W*r_w)
         x = x.reshape(b, c, f * p, h * r, w * r)
 
     else:

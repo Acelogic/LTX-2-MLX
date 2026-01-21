@@ -2,11 +2,16 @@
 
 from .connector import BasicTransformerBlock1D, Embeddings1DConnector
 from .encoder import (
-    CaptionProjection,
+    # Video-only encoder
     VideoGemmaEncoderOutput,
     VideoGemmaTextEncoderModel,
     create_text_encoder,
     load_text_encoder_weights,
+    # Audio+Video encoder
+    AudioVideoGemmaEncoderOutput,
+    AudioVideoGemmaTextEncoderModel,
+    create_av_text_encoder,
+    load_av_text_encoder_weights,
 )
 from .feature_extractor import (
     GemmaFeaturesExtractorProjLinear,
@@ -20,11 +25,14 @@ __all__ = [
     # Connector
     "BasicTransformerBlock1D",
     "Embeddings1DConnector",
-    # Caption projection
-    "CaptionProjection",
-    # Main encoder
+    # Video-only encoder
     "VideoGemmaTextEncoderModel",
     "VideoGemmaEncoderOutput",
     "create_text_encoder",
     "load_text_encoder_weights",
+    # Audio+Video encoder
+    "AudioVideoGemmaTextEncoderModel",
+    "AudioVideoGemmaEncoderOutput",
+    "create_av_text_encoder",
+    "load_av_text_encoder_weights",
 ]

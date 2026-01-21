@@ -373,7 +373,7 @@ class TestTextToVideoPipelineConfig:
         assert mx.allclose(latent1, latent2)
 
     def test_prepare_text_context_with_cfg(self, mock_pipeline):
-        """Test text context preparation with CFG."""
+        """Test text context preparation with CFG (fallback to zeros)."""
         pipeline = mock_pipeline
 
         text_encoding = mx.ones((1, 10, 256))
@@ -387,9 +387,35 @@ class TestTextToVideoPipelineConfig:
         assert context.shape == (2, 10, 256)
         assert mask.shape == (2, 10)
 
-        # First half should be original, second half zeros (uncond)
+        # First half should be original, second half zeros (uncond fallback)
         assert mx.allclose(context[0], text_encoding[0])
         assert mx.allclose(context[1], mx.zeros((10, 256)))
+
+    def test_prepare_text_context_with_negative_encoding(self, mock_pipeline):
+        """Test text context preparation with explicit negative encoding."""
+        pipeline = mock_pipeline
+
+        text_encoding = mx.ones((1, 10, 256))
+        text_mask = mx.ones((1, 10))
+        # Simulate encoded empty string (non-zero values)
+        negative_encoding = mx.full((1, 10, 256), 0.5)
+        negative_mask = mx.ones((1, 10))
+
+        context, mask = pipeline.prepare_text_context(
+            text_encoding,
+            text_mask,
+            cfg_scale=7.5,
+            negative_encoding=negative_encoding,
+            negative_mask=negative_mask,
+        )
+
+        # With CFG, batch dimension should double
+        assert context.shape == (2, 10, 256)
+        assert mask.shape == (2, 10)
+
+        # First half should be original, second half should be negative encoding
+        assert mx.allclose(context[0], text_encoding[0])
+        assert mx.allclose(context[1], negative_encoding[0])
 
     def test_prepare_text_context_without_cfg(self, mock_pipeline):
         """Test text context preparation without CFG."""

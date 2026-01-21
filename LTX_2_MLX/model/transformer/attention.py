@@ -158,7 +158,7 @@ class Attention(nn.Module):
         heads: int = 8,
         dim_head: int = 64,
         norm_eps: float = 1e-6,
-        rope_type: LTXRopeType = LTXRopeType.SPLIT,
+        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,  # PyTorch default
     ):
         """
         Initialize attention module.

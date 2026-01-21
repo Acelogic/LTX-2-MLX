@@ -36,7 +36,7 @@ class Gemma3Config:
     num_key_value_heads: int = 8
     head_dim: int = 256
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 10000.0
+    rope_theta: float = 1000000.0  # Gemma3 uses 10^6, not 10^4
     rope_scaling_factor: float = 8.0
     max_position_embeddings: int = 131072
     sliding_window: int = 1024
@@ -185,6 +185,11 @@ class Gemma3Attention(nn.Module):
         # Get position embeddings
         if position_ids is None:
             position_ids = mx.arange(seq_len)
+        elif position_ids.ndim == 2:
+            # Handle batch dimension - use first batch item for rotary embeddings
+            # This is valid when all batch items have the same position pattern
+            # (typical for same-length padded sequences)
+            position_ids = position_ids[0]
         cos, sin = self.rotary_emb(position_ids)
 
         # Apply rotary embeddings
@@ -305,12 +310,11 @@ class Gemma3Model(nn.Module):
         """
         batch_size, seq_len = input_ids.shape
 
-        # Match HF Gemma behavior: derive positions from the attention mask.
-        if position_ids is None and attention_mask is not None:
-            position_ids = mx.cumsum(attention_mask, axis=1) - 1
-            position_ids = mx.where(attention_mask == 0, mx.zeros_like(position_ids), position_ids)
-            # Current pipeline encodes a single prompt per call.
-            position_ids = position_ids[0].astype(mx.int32)
+        # Match HF Gemma behavior: use sequential positions [0, 1, 2, ..., seq_len-1]
+        # regardless of attention mask. The attention mask only affects attention
+        # computation, not RoPE positions.
+        if position_ids is None:
+            position_ids = mx.arange(seq_len).astype(mx.int32)
 
         # Get embeddings and scale by sqrt(hidden_size)
         hidden_states = self.embed_tokens(input_ids) * self.embed_scale
@@ -334,10 +338,15 @@ class Gemma3Model(nn.Module):
                 mx.zeros((1,)),
                 mx.full((1,), float("-inf")),
             )
-            # Avoid all -inf rows for padded queries with left padding.
+            # Combine causal and padding masks first
+            combined_mask = causal_mask[None, None, :, :] + padding_mask
+
+            # Fix for left-padded sequences: if a query position is padded and would
+            # result in all -inf (can't attend to anything), allow it to attend to
+            # everything to avoid NaN in softmax. This matches PyTorch behavior.
+            # See: https://github.com/pytorch/pytorch/issues/110213
             query_is_pad = binary_attention_mask[:, None, :, None] == 0
-            padding_mask = mx.where(query_is_pad, mx.zeros_like(padding_mask), padding_mask)
-            attention_mask = causal_mask[None, None, :, :] + padding_mask
+            attention_mask = mx.where(query_is_pad, mx.zeros_like(combined_mask), combined_mask)
 
         # Process through layers
         try:

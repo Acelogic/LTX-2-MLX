@@ -8,7 +8,16 @@ from typing import Tuple
 import mlx.core as mx
 import mlx.nn as nn
 
-from .decoder import CausalConv2d, SimpleResBlock2d, LATENT_DOWNSAMPLE_FACTOR
+from LTX_2_MLX.components.patchifiers import AudioPatchifier
+from LTX_2_MLX.types import AudioLatentShape
+
+from .decoder import (
+    CausalConv2d,
+    CausalityAxis,
+    PerChannelStatistics,
+    SimpleResBlock2d,
+    LATENT_DOWNSAMPLE_FACTOR,
+)
 
 
 class Downsample2d(nn.Module):
@@ -22,43 +31,6 @@ class Downsample2d(nn.Module):
     def __call__(self, x: mx.array) -> mx.array:
         """Downsample by 2x."""
         return self.conv(x)
-
-
-class PerChannelStatistics(nn.Module):
-    """Per-channel normalization using learned mean and std."""
-
-    def __init__(self, latent_channels: int):
-        super().__init__()
-        self.latent_channels = latent_channels
-        # Learned statistics for normalization
-        self.channel_mean = mx.zeros((latent_channels,))
-        self.channel_std = mx.ones((latent_channels,))
-
-    def normalize(self, x: mx.array) -> mx.array:
-        """Normalize input using channel statistics."""
-        # x shape: (B, C, H, W) or (B, T, C)
-        # Expand stats for broadcasting
-        if x.ndim == 4:
-            # (B, C, H, W) format
-            mean = self.channel_mean[None, :, None, None]
-            std = self.channel_std[None, :, None, None]
-        else:
-            # (B, T, C) format
-            mean = self.channel_mean[None, None, :]
-            std = self.channel_std[None, None, :]
-
-        return (x - mean) / (std + 1e-6)
-
-    def denormalize(self, x: mx.array) -> mx.array:
-        """Denormalize input using channel statistics."""
-        if x.ndim == 4:
-            mean = self.channel_mean[None, :, None, None]
-            std = self.channel_std[None, :, None, None]
-        else:
-            mean = self.channel_mean[None, None, :]
-            std = self.channel_std[None, None, :]
-
-        return x * std + mean
 
 
 class AudioEncoder(nn.Module):
@@ -85,7 +57,11 @@ class AudioEncoder(nn.Module):
         ch_mult: Tuple[int, ...] = (1, 2, 4),  # 3 levels
         num_res_blocks: int = 3,
         z_channels: int = 8,
+        mel_bins: int = 16,  # Latent mel bins (64/4 = 16)
         double_z: bool = True,
+        sample_rate: int = 16000,
+        mel_hop_length: int = 160,
+        is_causal: bool = True,
         compute_dtype: mx.Dtype = mx.float32,
     ):
         super().__init__()
@@ -95,11 +71,22 @@ class AudioEncoder(nn.Module):
         self.num_res_blocks = num_res_blocks
         self.num_resolutions = len(ch_mult)
         self.z_channels = z_channels
+        self.mel_bins = mel_bins
         self.double_z = double_z
         self.compute_dtype = compute_dtype
 
-        # Per-channel statistics for normalization
-        self.per_channel_statistics = PerChannelStatistics(z_channels)
+        # Per-channel statistics for normalization (patchified: ch = z_channels * mel_bins)
+        # PyTorch AudioEncoder uses ch (128) for the stats, which equals z_channels * mel_bins
+        self.per_channel_statistics = PerChannelStatistics(ch)
+
+        # Patchifier for normalization pipeline (patchify → normalize → unpatchify)
+        self.patchifier = AudioPatchifier(
+            patch_size=1,
+            audio_latent_downsample_factor=LATENT_DOWNSAMPLE_FACTOR,
+            sample_rate=sample_rate,
+            hop_length=mel_hop_length,
+            is_causal=is_causal,
+        )
 
         # Input conv: in_ch -> base channels
         self.conv_in = CausalConv2d(in_ch, ch, kernel_size=3)
@@ -186,17 +173,34 @@ class AudioEncoder(nn.Module):
         """
         Normalize encoder latents using per-channel statistics.
 
-        When double_z=True, the output has 2*z_channels (mean and logvar).
-        We only normalize the mean part (first half).
+        Follows PyTorch pipeline: patchify → normalize → unpatchify.
+        When double_z=True, we only normalize the mean part (first half).
         """
+        # Extract mean latent when double_z
         if self.double_z:
-            # Split into mean and logvar
             mean_latent = latent_output[:, :self.z_channels, :, :]
-            # Normalize mean only
-            mean_normalized = self.per_channel_statistics.normalize(mean_latent)
-            return mean_normalized
         else:
-            return self.per_channel_statistics.normalize(latent_output)
+            mean_latent = latent_output
+
+        # Build shape info for patchifier
+        latent_shape = AudioLatentShape(
+            batch=mean_latent.shape[0],
+            channels=mean_latent.shape[1],
+            frames=mean_latent.shape[2],
+            mel_bins=mean_latent.shape[3],
+        )
+
+        # PyTorch pipeline: patchify → normalize → unpatchify
+        # Patchify: (B, C, T, F) -> (B, T, C*F)
+        latent_patched = self.patchifier.patchify(mean_latent)
+
+        # Normalize in patchified space
+        latent_normalized = self.per_channel_statistics.normalize(latent_patched)
+
+        # Unpatchify back to 4D: (B, T, C*F) -> (B, C, T, F)
+        latent_output = self.patchifier.unpatchify(latent_normalized, latent_shape)
+
+        return latent_output
 
 
 def load_audio_encoder_weights(encoder: AudioEncoder, weights_path: str) -> None:
@@ -247,13 +251,23 @@ def load_audio_encoder_weights(encoder: AudioEncoder, weights_path: str) -> None
         _load_conv_weights(encoder.conv_out, f, "audio_vae.encoder.conv_out")
 
         # Load per-channel statistics
-        if "audio_vae.encoder.per_channel_statistics.channel_mean" in keys:
-            mean = f.get_tensor("audio_vae.encoder.per_channel_statistics.channel_mean")
-            encoder.per_channel_statistics.channel_mean = mx.array(mean.numpy())
+        # PyTorch uses hyphenated names: mean-of-means, std-of-means
+        mean_key = "audio_vae.encoder.per_channel_statistics.mean-of-means"
+        std_key = "audio_vae.encoder.per_channel_statistics.std-of-means"
 
-        if "audio_vae.encoder.per_channel_statistics.channel_std" in keys:
-            std = f.get_tensor("audio_vae.encoder.per_channel_statistics.channel_std")
-            encoder.per_channel_statistics.channel_std = mx.array(std.numpy())
+        if mean_key in keys:
+            mean = f.get_tensor(mean_key)
+            if mean.dtype == pt.bfloat16:
+                mean = mean.to(pt.float32)
+            encoder.per_channel_statistics.mean_of_means = mx.array(mean.numpy())
+            print(f"    Loaded mean-of-means: shape={mean.shape}, mean={float(mean.mean()):.4f}")
+
+        if std_key in keys:
+            std = f.get_tensor(std_key)
+            if std.dtype == pt.bfloat16:
+                std = std.to(pt.float32)
+            encoder.per_channel_statistics.std_of_means = mx.array(std.numpy())
+            print(f"    Loaded std-of-means: shape={std.shape}, mean={float(std.mean()):.4f}")
 
     mx.eval(encoder.parameters())
     print("  Audio encoder weights loaded successfully")

@@ -530,7 +530,7 @@ class ICLoraPipeline:
 
             # Create modality
             modality = modality_from_state(
-                video_state, context, context_mask, sigma
+                video_state, context, sigma
             )
 
             # Run model

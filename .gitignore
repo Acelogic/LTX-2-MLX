@@ -56,6 +56,11 @@ weights/
 *.png
 output/
 gens/
+outputs/
+
+# Allow example files
+!examples/*.mp4
+!examples/*.png
 
 # Logs
 *.log

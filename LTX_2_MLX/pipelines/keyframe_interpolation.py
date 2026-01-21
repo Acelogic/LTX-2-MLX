@@ -256,7 +256,7 @@ class KeyframeInterpolationPipeline:
 
             # Create positive modality
             pos_modality = modality_from_state(
-                video_state, context_pos, context_mask_pos, sigma
+                video_state, context_pos, sigma
             )
 
             # Run positive pass
@@ -265,7 +265,7 @@ class KeyframeInterpolationPipeline:
             # Run negative pass for CFG
             if cfg_guider.enabled():
                 neg_modality = modality_from_state(
-                    video_state, context_neg, context_mask_neg, sigma
+                    video_state, context_neg, sigma
                 )
                 denoised_neg = self.transformer(neg_modality)
 

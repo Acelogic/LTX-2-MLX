@@ -153,13 +153,17 @@ def post_process_latent(
     """Blend denoised output with clean state based on mask.
 
     Args:
-        denoised: Denoised latent tensor
-        denoise_mask: Mask indicating which regions were denoised (1 = denoised, 0 = clean)
-        clean_latent: Original clean latent tensor
+        denoised: Denoised latent tensor of shape (B, T, C)
+        denoise_mask: Mask indicating which regions were denoised (1 = denoised, 0 = clean),
+                      shape (B, T) or (B, T, C)
+        clean_latent: Original clean latent tensor of shape (B, T, C)
 
     Returns:
         Blended latent tensor
     """
+    # Expand mask for broadcasting if needed: (B, T) -> (B, T, 1)
+    if denoise_mask.ndim == 2 and denoised.ndim == 3:
+        denoise_mask = mx.expand_dims(denoise_mask, axis=-1)
     return (denoised * denoise_mask + clean_latent * (1 - denoise_mask)).astype(
         denoised.dtype
     )
@@ -181,7 +185,6 @@ def timesteps_from_mask(denoise_mask: mx.array, sigma: float) -> mx.array:
 def modality_from_state(
     state: LatentState,
     context: mx.array,
-    context_mask: mx.array,
     sigma: float,
     enabled: bool = True,
 ) -> Modality:
@@ -190,18 +193,47 @@ def modality_from_state(
     Args:
         state: Latent state containing latent, denoise_mask, and positions
         context: Text context embeddings
-        context_mask: Attention mask for context
         sigma: Current noise level (sigma value from scheduler)
         enabled: Whether this modality is enabled
 
     Returns:
         Modality object ready for transformer input
     """
+    # PyTorch always uses context_mask=None in modality_from_latent_state
     return Modality(
         enabled=enabled,
         latent=state.latent,
         timesteps=timesteps_from_mask(state.denoise_mask, sigma),
         positions=state.positions,
         context=context,
-        context_mask=context_mask,
+        context_mask=None,
+    )
+
+
+def audio_modality_from_state(
+    state: LatentState,
+    context: mx.array,
+    sigma: float,
+    enabled: bool = True,
+) -> Modality:
+    """Create a Modality from an audio latent state.
+
+    Args:
+        state: Audio latent state containing latent, denoise_mask, and positions
+        context: Text context embeddings (audio encoding)
+        sigma: Current noise level (sigma value from scheduler)
+        enabled: Whether this modality is enabled
+
+    Returns:
+        Modality object ready for transformer input
+    """
+    # Audio uses the same Modality structure as video
+    # PyTorch always uses context_mask=None in modality_from_latent_state
+    return Modality(
+        enabled=enabled,
+        latent=state.latent,
+        timesteps=timesteps_from_mask(state.denoise_mask, sigma),
+        positions=state.positions,
+        context=context,
+        context_mask=None,
     )

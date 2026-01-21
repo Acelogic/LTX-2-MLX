@@ -143,6 +143,16 @@ def convert_text_encoder_key(pytorch_key: str) -> Optional[str]:
             "feature_extractor.",
         )
 
+    # Handle video_embeddings_connector (video-only encoder) first
+    if "video_embeddings_connector" in pytorch_key:
+        # model.diffusion_model.video_embeddings_connector.xxx
+        # -> embeddings_connector.xxx
+        return pytorch_key.replace(
+            "model.diffusion_model.video_embeddings_connector.",
+            "embeddings_connector.",
+        )
+
+    # Handle generic embeddings_connector (for audio/AV encoder)
     if "embeddings_connector" in pytorch_key:
         # model.diffusion_model.embeddings_connector.xxx
         # -> embeddings_connector.xxx
@@ -193,9 +203,8 @@ def extract_transformer_weights(
         if new_key is None:
             continue
 
-        # Transpose linear weights
-        if value.ndim == 2 and ".weight" in key:
-            value = value.T
+        # Note: MLX and PyTorch both store Linear weights as [out_features, in_features],
+        # so NO transpose is needed here. See load_transformer_weights() for reference.
 
         converted[new_key] = value
 
@@ -223,9 +232,8 @@ def extract_vae_weights(
 
         mlx_key = key.replace("vae.", "")
 
-        # Transpose 2D weights (linear layers)
-        if value.ndim == 2 and ".weight" in key:
-            value = value.T
+        # Note: MLX and PyTorch both store Linear weights as [out_features, in_features],
+        # so NO transpose is needed here.
 
         if mlx_key.startswith("encoder."):
             encoder_weights[mlx_key.replace("encoder.", "")] = value
@@ -258,9 +266,8 @@ def extract_text_encoder_weights(
         if new_key is None:
             continue
 
-        # Transpose linear weights
-        if value.ndim == 2 and ".weight" in key:
-            value = value.T
+        # Note: MLX and PyTorch both store Linear weights as [out_features, in_features],
+        # so NO transpose is needed here.
 
         converted[new_key] = value
 
@@ -285,7 +292,8 @@ def convert_pytorch_key_to_mlx(pytorch_key: str, include_audio: bool = False) ->
         if "av_ca" in key or "audio" in key.lower():
             return None
 
-    # Skip video_embeddings_connector for now (text encoder part)
+    # Skip video_embeddings_connector - these are text encoder weights loaded separately
+    # via load_text_encoder_weights(), not part of the transformer model
     if "video_embeddings_connector" in key:
         return None
 

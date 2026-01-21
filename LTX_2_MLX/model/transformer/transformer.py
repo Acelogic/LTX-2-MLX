@@ -9,6 +9,7 @@ import mlx.nn as nn
 from .attention import Attention, rms_norm
 from .feed_forward import FeedForward
 from .rope import LTXRopeType
+from ...components.perturbations import BatchedPerturbationConfig, PerturbationType
 
 
 # Compiled AdaLN helper - fuses normalization with scale/shift for better performance
@@ -109,7 +110,6 @@ class BasicTransformerBlock(nn.Module):
         context_dim: int,
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
-        cross_attn_scale: float = 1.0,
     ):
         """
         Initialize transformer block.
@@ -121,13 +121,8 @@ class BasicTransformerBlock(nn.Module):
             context_dim: Dimension of cross-attention context.
             rope_type: Type of RoPE to use.
             norm_eps: Epsilon for normalization.
-            cross_attn_scale: Scaling factor for cross-attention output.
-                Higher values increase the influence of text conditioning.
-                Default 1.0. Values like 5-10 can help preserve text
-                differentiation in late layers.
         """
         super().__init__()
-        self.cross_attn_scale = cross_attn_scale
 
         self.norm_eps = norm_eps
 
@@ -214,13 +209,12 @@ class BasicTransformerBlock(nn.Module):
         x = _compiled_residual_gate(x, attn_out, gate_msa)
 
         # Cross-attention (no AdaLN, just RMSNorm)
-        # Apply cross_attn_scale to increase text conditioning influence
         cross_out = self.attn2(
             rms_norm(x, eps=self.norm_eps),
             context=args.context,
             mask=args.context_mask,
         )
-        x = x + cross_out * self.cross_attn_scale
+        x = x + cross_out
 
         # Get AdaLN values for FFN
         shift_mlp, scale_mlp, gate_mlp = self.get_ada_values(
@@ -254,9 +248,8 @@ class BasicAVTransformerBlock(nn.Module):
         idx: int,
         video_config: Optional[TransformerConfig] = None,
         audio_config: Optional[TransformerConfig] = None,
-        rope_type: LTXRopeType = LTXRopeType.SPLIT,
+        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,  # PyTorch default
         norm_eps: float = 1e-6,
-        cross_attn_scale: float = 1.0,
     ):
         """
         Initialize AudioVideo transformer block.
@@ -267,13 +260,11 @@ class BasicAVTransformerBlock(nn.Module):
             audio_config: Configuration for audio stream (dim=2048, heads=32, head_dim=64).
             rope_type: Type of RoPE to use.
             norm_eps: Epsilon for normalization.
-            cross_attn_scale: Scaling factor for cross-attention output (default 1.0).
         """
         super().__init__()
 
         self.idx = idx
         self.norm_eps = norm_eps
-        self.cross_attn_scale = cross_attn_scale
 
         # Video components
         if video_config is not None:
@@ -409,7 +400,7 @@ class BasicAVTransformerBlock(nn.Module):
         self,
         video: Optional[TransformerArgs],
         audio: Optional[TransformerArgs],
-        skip_video_self_attn: bool = False,
+        perturbations: Optional[BatchedPerturbationConfig] = None,
     ) -> tuple:
         """
         Forward pass through AudioVideo transformer block.
@@ -417,7 +408,9 @@ class BasicAVTransformerBlock(nn.Module):
         Args:
             video: Video TransformerArgs (or None if video disabled).
             audio: Audio TransformerArgs (or None if audio disabled).
-            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
+            perturbations: Optional perturbation config for STG guidance.
+                Supports 4 perturbation types: skip_video_self_attn, skip_audio_self_attn,
+                skip_a2v_cross_attn, skip_v2a_cross_attn.
 
         Returns:
             Tuple of (updated_video_args, updated_audio_args).
@@ -431,6 +424,24 @@ class BasicAVTransformerBlock(nn.Module):
         run_a2v = run_vx and ax is not None and ax.size > 0
         run_v2a = run_ax and vx is not None and vx.size > 0
 
+        # Check perturbations for this block
+        skip_video_self = (
+            perturbations is not None
+            and perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
+        )
+        skip_audio_self = (
+            perturbations is not None
+            and perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
+        )
+        skip_a2v = (
+            perturbations is not None
+            and perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx)
+        )
+        skip_v2a = (
+            perturbations is not None
+            and perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx)
+        )
+
         # Video self-attention + cross-attention to text
         if run_vx:
             assert video is not None and vx is not None  # Type narrowing
@@ -439,22 +450,19 @@ class BasicAVTransformerBlock(nn.Module):
             )
 
             # Video self-attention with compiled AdaLN and residual gate
-            # Skip self-attention if STG perturbation is enabled
-            if not skip_video_self_attn:
+            # Skip self-attention if perturbation is enabled for all samples in batch
+            if not skip_video_self:
                 norm_vx = _compiled_adaln_forward(vx, scale_msa, shift_msa, self.norm_eps)
                 attn_out = self.attn1(norm_vx, pe=video.positional_embeddings)
                 vx = _compiled_residual_gate(vx, attn_out, gate_msa)
 
-            # Video cross-attention to text
-            # No AdaLN here, just RMSNorm. But we apply cross_attn_scale.
+            # Video cross-attention to text (no AdaLN, just RMSNorm)
             cross_out = self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
                 mask=video.context_mask,
             )
-            # Apply scaling if defined
-            scale = getattr(self, "cross_attn_scale", 1.0)
-            vx = vx + cross_out * scale
+            vx = vx + cross_out
 
         # Audio self-attention + cross-attention to text
         if run_ax:
@@ -462,13 +470,21 @@ class BasicAVTransformerBlock(nn.Module):
             ashift_msa, ascale_msa, agate_msa = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, 0, 3
             )
-            norm_ax = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_msa) + ashift_msa
-            ax = ax + self.audio_attn1(norm_ax, pe=audio.positional_embeddings) * agate_msa
-            ax = ax + self.audio_attn2(
+
+            # Audio self-attention with compiled AdaLN and residual gate (matching video path)
+            # Skip self-attention if perturbation is enabled for all samples in batch
+            if not skip_audio_self:
+                norm_ax = _compiled_adaln_forward(ax, ascale_msa, ashift_msa, self.norm_eps)
+                attn_out = self.audio_attn1(norm_ax, pe=audio.positional_embeddings)
+                ax = _compiled_residual_gate(ax, attn_out, agate_msa)
+
+            # Audio cross-attention to text (no AdaLN, just RMSNorm)
+            cross_out = self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
                 mask=audio.context_mask,
             )
+            ax = ax + cross_out
 
         # Audio-Video cross-modal attention
         if run_a2v or run_v2a:
@@ -508,7 +524,8 @@ class BasicAVTransformerBlock(nn.Module):
             )
 
             # Audio to Video attention (audio features inform video)
-            if run_a2v:
+            # Skip if perturbation is enabled for all samples in batch
+            if run_a2v and not skip_a2v:
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
                 vx = vx + (
@@ -522,7 +539,8 @@ class BasicAVTransformerBlock(nn.Module):
                 )
 
             # Video to Audio attention (video features inform audio)
-            if run_v2a:
+            # Skip if perturbation is enabled for all samples in batch
+            if run_v2a and not skip_v2a:
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
                 ax = ax + (
@@ -552,8 +570,10 @@ class BasicAVTransformerBlock(nn.Module):
             ashift_mlp, ascale_mlp, agate_mlp = self.get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, 3, 6
             )
-            ax_scaled = rms_norm(ax, eps=self.norm_eps) * (1 + ascale_mlp) + ashift_mlp
-            ax = ax + self.audio_ff(ax_scaled) * agate_mlp
+            # Use compiled helpers (matching video path)
+            ax_scaled = _compiled_adaln_forward(ax, ascale_mlp, ashift_mlp, self.norm_eps)
+            ff_out = self.audio_ff(ax_scaled)
+            ax = _compiled_residual_gate(ax, ff_out, agate_mlp)
 
         # Return updated args
         video_out = video.replace(x=vx) if video is not None else None

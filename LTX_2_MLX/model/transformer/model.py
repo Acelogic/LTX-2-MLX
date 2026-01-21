@@ -10,6 +10,7 @@ import mlx.nn as nn
 from .rope import LTXRopeType, precompute_freqs_cis
 from .timestep_embedding import AdaLayerNormSingle
 from .transformer import BasicTransformerBlock, BasicAVTransformerBlock, TransformerArgs, TransformerConfig
+from ...components.perturbations import BatchedPerturbationConfig
 
 
 
@@ -75,7 +76,7 @@ class TransformerArgsPreprocessor:
     - Patchify projection (linear embedding)
     - Timestep embedding via AdaLN
     - Caption projection
-    - Position embedding computation (RoPE) with caching
+    - Position embedding computation (RoPE)
     """
 
     def __init__(
@@ -89,8 +90,8 @@ class TransformerArgsPreprocessor:
         use_middle_indices_grid: bool = True,
         timestep_scale_multiplier: int = 1000,
         positional_embedding_theta: float = 10000.0,
-        rope_type: LTXRopeType = LTXRopeType.SPLIT,
-        cache_position_embeddings: bool = True,
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,  # LTX-2 distilled uses SPLIT
+        compute_dtype: mx.Dtype = mx.float32,
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -102,9 +103,7 @@ class TransformerArgsPreprocessor:
         self.timestep_scale_multiplier = timestep_scale_multiplier
         self.positional_embedding_theta = positional_embedding_theta
         self.rope_type = rope_type
-        self.cache_position_embeddings = cache_position_embeddings
-        # Cache for position embeddings indexed by shape tuple
-        self._pe_cache = {}
+        self.compute_dtype = compute_dtype
 
     def _prepare_timestep(
         self,
@@ -159,11 +158,20 @@ class TransformerArgsPreprocessor:
     def _prepare_attention_mask(
         self,
         attention_mask: Optional[mx.array],
+        target_dtype: mx.Dtype = mx.float32,
     ) -> Optional[mx.array]:
         """
         Prepare attention mask for cross-attention.
 
         Converts boolean mask to additive mask for softmax.
+        Uses dtype-appropriate masking values to match PyTorch finfo behavior.
+
+        Args:
+            attention_mask: Boolean or float mask of shape (B, S).
+            target_dtype: Target dtype for the mask (determines mask value).
+
+        Returns:
+            Additive attention mask of shape (B, 1, 1, S) or None.
         """
         if attention_mask is None:
             return None
@@ -172,23 +180,30 @@ class TransformerArgsPreprocessor:
         if attention_mask.dtype in (mx.float16, mx.float32, mx.bfloat16):
             return attention_mask
 
+        # Use dtype-appropriate max value (matches PyTorch finfo behavior)
+        # PyTorch uses (mask - 1) * finfo(dtype).max
+        if target_dtype == mx.float16:
+            mask_value = -65504.0  # ~-finfo(float16).max
+        elif target_dtype == mx.bfloat16:
+            mask_value = -3.38e38  # ~-finfo(bfloat16).max
+        else:
+            mask_value = -3.40e38  # ~-finfo(float32).max
+
         # Convert boolean mask to additive mask
-        # True = attend, False = don't attend
-        # For additive mask: 0 = attend, -inf = don't attend
-        mask = (1 - attention_mask.astype(mx.float32)) * -1e9
+        # True = attend (0), False = don't attend (large negative)
+        mask = (1 - attention_mask.astype(mx.float32)) * mask_value
         mask = mask.reshape(attention_mask.shape[0], 1, 1, attention_mask.shape[-1])
-        return mask
+        return mask.astype(target_dtype)
 
     def _prepare_positional_embeddings(
         self,
         positions: mx.array,
     ) -> Tuple[mx.array, mx.array]:
         """
-        Prepare RoPE positional embeddings with caching.
+        Prepare RoPE positional embeddings.
 
-        Position embeddings are expensive to compute but only depend on the
-        position grid shape, not the actual latent values. During denoising,
-        the latent shape stays constant, so we can cache and reuse embeddings.
+        No caching - matches PyTorch behavior and avoids stale cache bugs when
+        fps, causal_fix, or max_pos change while shape stays constant.
 
         Args:
             positions: Position indices, shape (B, n_dims, T, 2) where last dim is [start, end].
@@ -196,11 +211,6 @@ class TransformerArgsPreprocessor:
         Returns:
             Tuple of (cos_freq, sin_freq) for RoPE.
         """
-        # Use shape as cache key (positions have same shape across denoising steps)
-        cache_key = positions.shape
-        if self.cache_position_embeddings and cache_key in self._pe_cache:
-            return self._pe_cache[cache_key]
-
         pe = precompute_freqs_cis(
             indices_grid=positions,
             dim=self.inner_dim,
@@ -211,11 +221,6 @@ class TransformerArgsPreprocessor:
             num_attention_heads=self.num_attention_heads,
             rope_type=self.rope_type,
         )
-
-        # Cache the result
-        if self.cache_position_embeddings:
-            self._pe_cache[cache_key] = pe
-
         return pe
 
     def prepare(self, modality: Modality) -> TransformerArgs:
@@ -240,8 +245,10 @@ class TransformerArgsPreprocessor:
         # Prepare context (caption projection)
         context = self._prepare_context(modality.context, x)
 
-        # Prepare attention mask
-        attention_mask = self._prepare_attention_mask(modality.context_mask)
+        # Prepare attention mask with dtype-appropriate masking values
+        attention_mask = self._prepare_attention_mask(
+            modality.context_mask, target_dtype=self.compute_dtype
+        )
 
         # Prepare positional embeddings (RoPE)
         pe = self._prepare_positional_embeddings(modality.positions)
@@ -261,7 +268,7 @@ class MultiModalTransformerArgsPreprocessor:
     Preprocesses inputs for AudioVideo transformer blocks.
 
     Extends TransformerArgsPreprocessor to handle cross-modal attention:
-    - Separate positional embeddings for cross-attention (with caching)
+    - Separate positional embeddings for cross-attention
     - Cross-attention timestep embeddings (scale/shift and gate)
     """
 
@@ -272,7 +279,7 @@ class MultiModalTransformerArgsPreprocessor:
         cross_gate_adaln: AdaLayerNormSingle,
         cross_pe_max_pos: int,
         audio_cross_attention_dim: int,
-        av_ca_timestep_scale_multiplier: int = 1000,
+        av_ca_timestep_scale_multiplier: int = 1,  # PyTorch default (av_ca_factor = 1/1000)
     ):
         """
         Initialize multi-modal preprocessor.
@@ -291,23 +298,17 @@ class MultiModalTransformerArgsPreprocessor:
         self.cross_pe_max_pos = cross_pe_max_pos
         self.audio_cross_attention_dim = audio_cross_attention_dim
         self.av_ca_timestep_scale_multiplier = av_ca_timestep_scale_multiplier
-        # Cache for cross-modal position embeddings
-        self._cross_pe_cache = {}
 
     def _prepare_cross_positional_embeddings(
         self,
         positions: mx.array,
     ) -> Tuple[mx.array, mx.array]:
         """
-        Prepare cross-modal positional embeddings with caching.
+        Prepare cross-modal positional embeddings.
 
+        No caching - matches PyTorch behavior and avoids stale cache bugs.
         Uses only the temporal dimension for cross-modal attention.
         """
-        # Use shape as cache key
-        cache_key = positions.shape
-        if cache_key in self._cross_pe_cache:
-            return self._cross_pe_cache[cache_key]
-
         # Use only the first dimension (temporal) for cross-modal attention
         temporal_positions = positions[:, 0:1, :]
 
@@ -321,9 +322,6 @@ class MultiModalTransformerArgsPreprocessor:
             num_attention_heads=self.simple_preprocessor.num_attention_heads,
             rope_type=self.simple_preprocessor.rope_type,
         )
-
-        # Cache the result
-        self._cross_pe_cache[cache_key] = pe
         return pe
 
     def _prepare_cross_attention_timestep(
@@ -397,7 +395,9 @@ class LTXModel(nn.Module):
     AUDIO_HEAD_DIM = 64
     AUDIO_IN_CHANNELS = 128  # Audio VAE latent channels
     AUDIO_OUT_CHANNELS = 128
-    AUDIO_CROSS_PE_MAX_POS = 16384
+    # Audio cross-PE max position - PyTorch uses 20 for audio positional max
+    # and max(video_t, audio_t) for cross-modal positions (typically 20)
+    AUDIO_CROSS_PE_MAX_POS = 20
 
     def __init__(
         self,
@@ -413,14 +413,15 @@ class LTXModel(nn.Module):
         positional_embedding_theta: float = 10000.0,
         positional_embedding_max_pos: Optional[List[int]] = None,
         timestep_scale_multiplier: int = 1000,
-        av_ca_timestep_scale_multiplier: int = 1000,
+        # AV cross-attn timestep scale: PyTorch defaults to 1, giving av_ca_factor = 1/1000
+        # This controls the timestep scaling for audio-video cross attention
+        av_ca_timestep_scale_multiplier: int = 1,
         use_middle_indices_grid: bool = True,
+        # RoPE type: LTX-2 distilled weights use SPLIT
         rope_type: LTXRopeType = LTXRopeType.SPLIT,
         compute_dtype: mx.Dtype = mx.float32,
         low_memory: bool = False,
         fast_mode: bool = False,
-        cross_attn_scale_late: float = 1.0,
-        cross_attn_scale_start_layer: int = 40,
     ):
         """
         Initialize LTX model.
@@ -438,14 +439,13 @@ class LTXModel(nn.Module):
             positional_embedding_theta: Base theta for RoPE.
             positional_embedding_max_pos: Max positions [time, height, width].
             timestep_scale_multiplier: Scale for timestep (1000).
-            av_ca_timestep_scale_multiplier: Scale for cross-attention timestep.
+            av_ca_timestep_scale_multiplier: Scale for AV cross-attention timestep.
+                PyTorch default is 1, giving av_ca_factor = 1/1000.
             use_middle_indices_grid: Use middle of position bounds for RoPE.
-            rope_type: Type of RoPE (default INTERLEAVED).
+            rope_type: Type of RoPE. LTX-2 distilled weights use SPLIT.
             compute_dtype: Dtype for computation (float32 or float16).
             low_memory: If True, use aggressive memory optimization (eval every 4 layers).
             fast_mode: If True, skip intermediate evals for faster inference (uses more memory).
-            cross_attn_scale_late: Cross-attention scaling for late layers.
-            cross_attn_scale_start_layer: Layer at which to start applying scaling.
         """
         super().__init__()
 
@@ -572,7 +572,6 @@ class LTXModel(nn.Module):
                 audio_config=audio_config,
                 rope_type=rope_type,
                 norm_eps=norm_eps,
-                cross_attn_scale=cross_attn_scale_late if i >= cross_attn_scale_start_layer else 1.0,
             )
             for i in range(num_layers)
         ]
@@ -592,6 +591,7 @@ class LTXModel(nn.Module):
                 timestep_scale_multiplier=self.timestep_scale_multiplier,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                compute_dtype=self.compute_dtype,
             )
             if self.model_type.is_audio_enabled():
                 self._video_args_preprocessor = MultiModalTransformerArgsPreprocessor(
@@ -617,6 +617,7 @@ class LTXModel(nn.Module):
                 timestep_scale_multiplier=self.timestep_scale_multiplier,
                 positional_embedding_theta=self.positional_embedding_theta,
                 rope_type=self.rope_type,
+                compute_dtype=self.compute_dtype,
             )
             if self.model_type.is_video_enabled():
                 self._audio_args_preprocessor = MultiModalTransformerArgsPreprocessor(
@@ -630,25 +631,16 @@ class LTXModel(nn.Module):
             else:
                 self._audio_args_preprocessor = audio_simple_preprocessor
 
-    def set_cross_attn_scale(
-        self,
-        scale: float,
-        start_layer: int = 40,
-    ) -> None:
-        """Set cross-attention scaling."""
-        for i, block in enumerate(self.transformer_blocks):
-            block.cross_attn_scale = scale if i >= start_layer else 1.0
-
     def _process_transformer_blocks(
         self,
         video_args: Optional[TransformerArgs] = None,
         audio_args: Optional[TransformerArgs] = None,
-        skip_video_self_attn: bool = False,
+        perturbations: Optional[BatchedPerturbationConfig] = None,
     ) -> Tuple[Optional[TransformerArgs], Optional[TransformerArgs]]:
         """Process transformer blocks."""
         for i, block in enumerate(self.transformer_blocks):
-            video_args, audio_args = block(video_args, audio_args, skip_video_self_attn=skip_video_self_attn)
-            
+            video_args, audio_args = block(video_args, audio_args, perturbations=perturbations)
+
             # Reduce eval frequency for performance
             if self._eval_frequency > 0 and (i + 1) % self._eval_frequency == 0:
                 if video_args is not None:
@@ -693,7 +685,7 @@ class LTXModel(nn.Module):
         self,
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
-        skip_video_self_attn: bool = False,
+        perturbations: Optional[BatchedPerturbationConfig] = None,
     ) -> Union[mx.array, Tuple[mx.array, mx.array]]:
         """
         Forward pass.
@@ -701,7 +693,9 @@ class LTXModel(nn.Module):
         Args:
             video: Input video modality (required for VideoOnly/AudioVideo).
             audio: Input audio modality (required for AudioVideo/AudioOnly).
-            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
+            perturbations: Optional perturbation config for STG guidance.
+                Supports 4 types: skip_video_self_attn, skip_audio_self_attn,
+                skip_a2v_cross_attn, skip_v2a_cross_attn.
 
         Returns:
             VideoOnly: video_velocity
@@ -755,7 +749,7 @@ class LTXModel(nn.Module):
 
         # --- Transformer Blocks ---
         video_args, audio_args = self._process_transformer_blocks(
-            video_args, audio_args, skip_video_self_attn=skip_video_self_attn
+            video_args, audio_args, perturbations=perturbations
         )
 
         # --- Output Processing ---
@@ -799,7 +793,7 @@ class X0Model(nn.Module):
         self,
         video: Optional[Modality] = None,
         audio: Optional[Modality] = None,
-        skip_video_self_attn: bool = False,
+        perturbations: Optional[BatchedPerturbationConfig] = None,
     ) -> Union[mx.array, Tuple[mx.array, mx.array]]:
         """
         Compute denoised outputs.
@@ -807,9 +801,9 @@ class X0Model(nn.Module):
         Args:
             video: Video modality.
             audio: Audio modality.
-            skip_video_self_attn: If True, skip video self-attention (for STG perturbation).
+            perturbations: Optional perturbation config for STG guidance.
         """
-        output = self.velocity_model(video, audio, skip_video_self_attn=skip_video_self_attn)
+        output = self.velocity_model(video, audio, perturbations=perturbations)
 
         # Helper to denoise
         def denoise(modality, velocity):
