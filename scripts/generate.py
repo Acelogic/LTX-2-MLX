@@ -1119,9 +1119,6 @@ def generate_video(
     # Use dedicated two-stage pipeline for higher quality generation
     if pipeline_type == "two-stage":
         # Validate requirements
-        if generate_audio:
-            raise ValueError("Two-stage pipeline does not support audio generation mode. Use --pipeline text-to-video instead.")
-        
         if model is None:
             if use_placeholder:
                 print("  Creating dummy model for placeholder Two-Stage pipeline...")
@@ -1158,6 +1155,8 @@ def generate_video(
         if guidance_rescale > 0:
             print(f"  Guidance rescale: {guidance_rescale}")
         print(f"  Stage 2: 3 steps at {height}x{width} (distilled refinement)")
+        if generate_audio:
+            print(f"  Audio generation: ENABLED")
 
         # Load spatial upscaler
         print("\n[3.5/5] Loading spatial upscaler...")
@@ -1179,6 +1178,20 @@ def generate_video(
         else:
             print("  Skipping weights load (placeholder)")
 
+        # Load audio components if audio generation is enabled
+        audio_decoder = None
+        vocoder = None
+        if generate_audio:
+            print("  Loading Audio VAE decoder...")
+            audio_decoder = AudioDecoder(compute_dtype=compute_dtype)
+            if weights_path:
+                load_audio_decoder_weights(audio_decoder, weights_path)
+
+            print("  Loading Vocoder...")
+            vocoder = Vocoder(compute_dtype=compute_dtype)
+            if weights_path:
+                load_vocoder_weights(vocoder, weights_path)
+
         # Create two-stage pipeline
         print("\n[4/5] Creating two-stage pipeline...")
         pipeline = TwoStagePipeline(
@@ -1186,6 +1199,8 @@ def generate_video(
             video_encoder=video_encoder,
             video_decoder=vae_decoder,
             spatial_upscaler=spatial_upscaler,
+            audio_decoder=audio_decoder,
+            vocoder=vocoder,
         )
 
         # Create distilled LoRA config if provided
@@ -1208,6 +1223,7 @@ def generate_video(
             guidance_rescale=guidance_rescale,
             dtype=compute_dtype,
             distilled_lora_config=distilled_lora_config,
+            audio_enabled=generate_audio,
         )
 
         # Create image conditionings if provided
@@ -1222,11 +1238,13 @@ def generate_video(
 
         # Run pipeline
         print(f"\n[5/5] Running two-stage generation...")
-        video, _ = pipeline(
+        video, audio_waveform = pipeline(
             positive_encoding=text_encoding,
             negative_encoding=null_encoding,
             config=config,
             images=images,
+            positive_audio_encoding=text_audio_encoding if generate_audio else None,
+            negative_audio_encoding=null_audio_encoding if generate_audio else None,
         )
 
         # Convert to frames list for save_video
@@ -1235,9 +1253,15 @@ def generate_video(
         frames = [video_np[t] for t in range(video_np.shape[0])]
         print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
 
+        if audio_waveform is not None:
+            print(f"  Generated audio: {audio_waveform.shape}")
+
         # Save video
         print(f"\nSaving video to {output_path}...")
-        save_video(frames, output_path, fps=output_fps, speed=output_speed)
+        if audio_waveform is not None:
+            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed)
+        else:
+            save_video(frames, output_path, fps=output_fps, speed=output_speed)
         print(f"Done! Video saved to {output_path}")
         return
 
