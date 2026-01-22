@@ -442,7 +442,7 @@ class LTXModel(nn.Module):
             av_ca_timestep_scale_multiplier: Scale for AV cross-attention timestep.
                 PyTorch default is 1, giving av_ca_factor = 1/1000.
             use_middle_indices_grid: Use middle of position bounds for RoPE.
-            rope_type: Type of RoPE. LTX-2 distilled weights use SPLIT.
+            rope_type: Type of RoPE. LTX-2 distilled uses SPLIT.
             compute_dtype: Dtype for computation (float32 or float16).
             low_memory: If True, use aggressive memory optimization (eval every 4 layers).
             fast_mode: If True, skip intermediate evals for faster inference (uses more memory).

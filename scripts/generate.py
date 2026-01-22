@@ -719,6 +719,7 @@ def load_av_transformer(
     print(f"Loading AudioVideo transformer ({dtype_name}{fp8_str}{mem_str})...")
 
     model = LTXAVModel(
+        model_type=LTXModelType.AudioVideo,
         num_attention_heads=32,
         attention_head_dim=128,
         in_channels=128,

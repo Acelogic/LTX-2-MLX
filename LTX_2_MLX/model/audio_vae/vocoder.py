@@ -43,31 +43,15 @@ class Conv1d(nn.Module):
         Returns:
             Output tensor (B, out_C, T')
         """
-        b, c, t = x.shape
-
-        # Calculate effective kernel size with dilation
-        effective_k = (self.kernel_size - 1) * self.dilation + 1
-
         # Apply padding
         if self.padding > 0:
             x = mx.pad(x, [(0, 0), (0, 0), (self.padding, self.padding)])
 
-        # Handle dilation by inserting zeros into kernel
-        if self.dilation > 1:
-            # Create dilated kernel
-            dilated_k = effective_k
-            dilated_weight = mx.zeros((self.out_channels, dilated_k, self.in_channels))
-            for i in range(self.kernel_size):
-                dilated_weight[:, i * self.dilation, :] = self.weight[:, i, :]
-            weight = dilated_weight
-        else:
-            weight = self.weight
-
         # Transpose for MLX conv1d: (B, C, T) -> (B, T, C)
         x = x.transpose(0, 2, 1)
 
-        # MLX conv1d expects weight: (out_C, kW, in_C)
-        out = mx.conv1d(x, weight, stride=self.stride)
+        # MLX conv1d natively supports dilation
+        out = mx.conv1d(x, self.weight, stride=self.stride, dilation=self.dilation)
 
         # Transpose back: (B, T, C) -> (B, C, T)
         out = out.transpose(0, 2, 1)
@@ -283,8 +267,8 @@ class Vocoder(nn.Module):
 
             mx.eval(x)
 
-        # Output
-        x = nn.leaky_relu(x, negative_slope=LRELU_SLOPE)
+        # Output - PyTorch uses default leaky_relu slope (0.01) here, not LRELU_SLOPE
+        x = nn.leaky_relu(x)
         x = self.conv_post(x)
         x = mx.tanh(x)
 

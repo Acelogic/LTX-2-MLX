@@ -248,7 +248,7 @@ class BasicAVTransformerBlock(nn.Module):
         idx: int,
         video_config: Optional[TransformerConfig] = None,
         audio_config: Optional[TransformerConfig] = None,
-        rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,  # PyTorch default
+        rope_type: LTXRopeType = LTXRopeType.SPLIT,
         norm_eps: float = 1e-6,
     ):
         """

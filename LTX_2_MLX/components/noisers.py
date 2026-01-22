@@ -62,8 +62,14 @@ class GaussianNoiser:
             )
 
         # Scale the denoise mask by noise_scale
-        # Expand mask to broadcast with latent: (B, T) -> (B, T, 1)
-        scaled_mask = mx.expand_dims(latent_state.denoise_mask, axis=-1) * noise_scale
+        # Handle both 2D (B, T) and 3D (B, T, 1) masks from patchification
+        mask = latent_state.denoise_mask
+        if mask.ndim == 2:
+            # Expand mask to broadcast with latent: (B, T) -> (B, T, 1)
+            scaled_mask = mx.expand_dims(mask, axis=-1) * noise_scale
+        else:
+            # Mask is already 3D (B, T, 1), use directly
+            scaled_mask = mask * noise_scale
 
         # Blend noise with original latent based on mask
         # Where mask=1: use noise, where mask=0: keep original
@@ -108,8 +114,12 @@ class DeterministicNoiser:
             key=key,
         )
 
-        # Expand mask to broadcast with latent: (B, T) -> (B, T, 1)
-        scaled_mask = mx.expand_dims(latent_state.denoise_mask, axis=-1) * noise_scale
+        # Handle both 2D (B, T) and 3D (B, T, 1) masks from patchification
+        mask = latent_state.denoise_mask
+        if mask.ndim == 2:
+            scaled_mask = mx.expand_dims(mask, axis=-1) * noise_scale
+        else:
+            scaled_mask = mask * noise_scale
         latent = noise * scaled_mask + latent_state.latent * (1 - scaled_mask)
 
         return latent_state.replace(latent=latent.astype(latent_state.latent.dtype))

@@ -172,11 +172,11 @@ class OneStagePipeline:
         if self.audio_decoder is None or self.vocoder is None:
             raise ValueError("Audio decoder and vocoder required for audio decoding")
 
-        # Decode latent to mel spectrogram
+        # Decode latent to mel spectrogram (output is log-mel, which vocoder expects)
         mel_spectrogram = self.audio_decoder(audio_latent)
         mx.eval(mel_spectrogram)
 
-        # Convert mel spectrogram to waveform
+        # Convert mel spectrogram to waveform (vocoder takes log-mel directly)
         waveform = self.vocoder(mel_spectrogram)
         mx.eval(waveform)
 

@@ -209,11 +209,16 @@ class SimpleResBlock2d(nn.Module):
 
 
 class Upsample2d(nn.Module):
-    """2D upsampling with conv."""
+    """2D upsampling with conv and causal axis handling.
 
-    def __init__(self, channels: int):
+    After upsampling and conv, drops the first element along the causal axis
+    to undo encoder's padding, matching PyTorch behavior.
+    """
+
+    def __init__(self, channels: int, causality_axis: CausalityAxis = CausalityAxis.HEIGHT):
         super().__init__()
-        self.conv = CausalConv2d(channels, channels, kernel_size=3)
+        self.conv = CausalConv2d(channels, channels, kernel_size=3, causality_axis=causality_axis)
+        self.causality_axis = causality_axis
 
     def __call__(self, x: mx.array) -> mx.array:
         """Upsample by 2x."""
@@ -225,6 +230,15 @@ class Upsample2d(nn.Module):
         x = x.reshape(b, c, h * 2, w * 2)
 
         x = self.conv(x)
+
+        # Drop first element along causal axis to undo encoder padding
+        # This keeps the output length as 1 + 2*n instead of 2 + 2*n
+        if self.causality_axis == CausalityAxis.HEIGHT:
+            x = x[:, :, 1:, :]  # Drop first row
+        elif self.causality_axis == CausalityAxis.WIDTH:
+            x = x[:, :, :, 1:]  # Drop first column
+        # CausalityAxis.NONE: no drop needed
+
         return x
 
 
@@ -316,7 +330,9 @@ class AudioDecoder(nn.Module):
                 "upsample": upsample,
             })
 
-        # Output conv: ch -> out_ch
+        # Output normalization and conv: ch -> out_ch
+        # PixelNorm before final activation (matches PyTorch norm_out)
+        self.norm_out = PixelNorm(dim=1, eps=1e-6)
         self.conv_out = CausalConv2d(ch, out_ch, kernel_size=3)
 
     def _denormalize_latents(self, sample: mx.array) -> mx.array:
@@ -389,7 +405,8 @@ class AudioDecoder(nn.Module):
                 h = level["upsample"](h)
             mx.eval(h)
 
-        # Output (with activation before conv)
+        # Output: norm -> activation -> conv (matches PyTorch _finalize_output)
+        h = self.norm_out(h)
         h = nn.silu(h)
         h = self.conv_out(h)
 
@@ -448,7 +465,8 @@ def load_audio_decoder_weights(decoder: AudioDecoder, weights_path: str) -> None
                 loaded_count += 1
 
             if level_blocks["upsample"] is not None:
-                prefix = f"audio_vae.decoder.up.{pt_level}.upsample.conv"
+                # Checkpoint has double .conv: audio_vae.decoder.up.X.upsample.conv.conv.weight
+                prefix = f"audio_vae.decoder.up.{pt_level}.upsample.conv.conv"
                 _load_conv_weights(f, prefix, level_blocks["upsample"].conv, keys)
                 loaded_count += 1
 
@@ -458,8 +476,9 @@ def load_audio_decoder_weights(decoder: AudioDecoder, weights_path: str) -> None
 
         # Load per-channel statistics
         # PyTorch uses hyphenated names: mean-of-means, std-of-means
-        mean_key = "audio_vae.decoder.per_channel_statistics.mean-of-means"
-        std_key = "audio_vae.decoder.per_channel_statistics.std-of-means"
+        # Note: The checkpoint stores these at audio_vae.per_channel_statistics (not audio_vae.decoder.)
+        mean_key = "audio_vae.per_channel_statistics.mean-of-means"
+        std_key = "audio_vae.per_channel_statistics.std-of-means"
 
         if mean_key in keys:
             import torch
