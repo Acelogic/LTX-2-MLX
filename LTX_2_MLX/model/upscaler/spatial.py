@@ -88,6 +88,46 @@ def conv3d(
     return output
 
 
+def group_norm_5d(x: mx.array, num_groups: int, weight: mx.array, bias: mx.array, eps: float = 1e-5) -> mx.array:
+    """
+    Apply GroupNorm to 5D tensor (B, C, T, H, W).
+
+    PyTorch GroupNorm normalizes over (C/groups, T, H, W) for each group.
+    We must compute mean/var across all spatial AND temporal dimensions.
+
+    Args:
+        x: Input tensor (B, C, T, H, W)
+        num_groups: Number of groups
+        weight: Scale parameter (C,)
+        bias: Bias parameter (C,)
+        eps: Epsilon for numerical stability
+
+    Returns:
+        Normalized tensor (B, C, T, H, W)
+    """
+    b, c, t, h, w = x.shape
+    channels_per_group = c // num_groups
+
+    # Reshape to (B, num_groups, channels_per_group, T, H, W)
+    x = x.reshape(b, num_groups, channels_per_group, t, h, w)
+
+    # Compute mean and variance over (channels_per_group, T, H, W) = axes (2, 3, 4, 5)
+    mean = x.mean(axis=(2, 3, 4, 5), keepdims=True)
+    var = x.var(axis=(2, 3, 4, 5), keepdims=True)
+
+    # Normalize
+    x = (x - mean) / mx.sqrt(var + eps)
+
+    # Reshape back to (B, C, T, H, W)
+    x = x.reshape(b, c, t, h, w)
+
+    # Apply affine transform: weight * x + bias
+    # weight and bias are (C,), need to broadcast to (1, C, 1, 1, 1)
+    x = x * weight.reshape(1, -1, 1, 1, 1) + bias.reshape(1, -1, 1, 1, 1)
+
+    return x
+
+
 class ResBlock3d(nn.Module):
     """
     3D Residual block matching PyTorch reference exactly.
@@ -100,6 +140,10 @@ class ResBlock3d(nn.Module):
         if mid_channels is None:
             mid_channels = channels
 
+        self.num_groups = num_groups
+        self.mid_channels = mid_channels
+        self.channels = channels
+
         # Conv3d weights: (out_C, in_C, kT, kH, kW)
         self.conv1_weight = mx.zeros((mid_channels, channels, 3, 3, 3))
         self.conv1_bias = mx.zeros((mid_channels,))
@@ -107,7 +151,7 @@ class ResBlock3d(nn.Module):
         self.conv2_weight = mx.zeros((channels, mid_channels, 3, 3, 3))
         self.conv2_bias = mx.zeros((channels,))
 
-        # GroupNorm
+        # GroupNorm parameters (we'll apply manually for 5D)
         self.norm1 = nn.GroupNorm(num_groups, mid_channels)
         self.norm2 = nn.GroupNorm(num_groups, channels)
 
@@ -120,25 +164,16 @@ class ResBlock3d(nn.Module):
             Output tensor (B, C, T, H, W)
         """
         residual = x
-        b, c, t, h, w = x.shape
 
         # conv1 -> norm1 -> act
         x = conv3d(x, self.conv1_weight, self.conv1_bias, padding=1)
-        # GroupNorm expects (B, ..., C) - need to transpose
-        x = x.transpose(0, 2, 3, 4, 1)  # (B, T, H, W, C)
-        x = x.reshape(b * t, h, w, -1)  # (B*T, H, W, C)
-        x = self.norm1(x)
-        x = x.reshape(b, t, h, w, -1)  # (B, T, H, W, C)
-        x = x.transpose(0, 4, 1, 2, 3)  # (B, C, T, H, W)
+        # Apply GroupNorm correctly for 5D tensor
+        x = group_norm_5d(x, self.num_groups, self.norm1.weight, self.norm1.bias)
         x = nn.silu(x)
 
         # conv2 -> norm2
         x = conv3d(x, self.conv2_weight, self.conv2_bias, padding=1)
-        x = x.transpose(0, 2, 3, 4, 1)  # (B, T, H, W, C)
-        x = x.reshape(b * t, h, w, -1)  # (B*T, H, W, C)
-        x = self.norm2(x)
-        x = x.reshape(b, t, h, w, -1)  # (B, T, H, W, C)
-        x = x.transpose(0, 4, 1, 2, 3)  # (B, C, T, H, W)
+        x = group_norm_5d(x, self.num_groups, self.norm2.weight, self.norm2.bias)
 
         # act(x + residual) - activation AFTER residual, matching PyTorch
         x = nn.silu(x + residual)
@@ -316,6 +351,7 @@ class SpatialUpscaler(nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.mid_channels = mid_channels
+        self.num_groups = num_groups
 
         # Initial conv: 128 -> 1024, (out_C, in_C, kT, kH, kW)
         self.initial_conv_weight = mx.zeros((mid_channels, in_channels, 3, 3, 3))
@@ -347,16 +383,12 @@ class SpatialUpscaler(nn.Module):
         Returns:
             Upscaled latent (B, C, F, H*2, W*2)
         """
-        b, c, f, h, w = x.shape
+        b, _, f, h, w = x.shape
 
         # Initial projection: conv -> norm -> act
         x = conv3d(x, self.initial_conv_weight, self.initial_conv_bias, padding=1)
-        # GroupNorm expects NHWC, need to transpose for per-frame norm
-        x = x.transpose(0, 2, 3, 4, 1)  # (B, F, H, W, C)
-        x = x.reshape(b * f, h, w, -1)  # (B*F, H, W, C)
-        x = self.initial_norm(x)
-        x = x.reshape(b, f, h, w, -1)   # (B, F, H, W, C)
-        x = x.transpose(0, 4, 1, 2, 3)  # (B, C, F, H, W)
+        # Apply GroupNorm correctly for 5D tensor (normalizing across T, H, W)
+        x = group_norm_5d(x, self.num_groups, self.initial_norm.weight, self.initial_norm.bias)
         x = nn.silu(x)
 
         # Pre-upsample residual blocks (batched eval for better performance)

@@ -119,8 +119,15 @@ from LTX_2_MLX.pipelines.common import ImageCondition
 from LTX_2_MLX.pipelines.ic_lora import (
     ControlType,
     VideoCondition,
+    ICLoraPipeline,
+    ICLoraConfig,
     preprocess_control_signal,
     load_control_signal_tensor,
+)
+from LTX_2_MLX.pipelines.keyframe_interpolation import (
+    KeyframeInterpolationPipeline,
+    KeyframeInterpolationConfig,
+    Keyframe,
 )
 from LTX_2_MLX.model.video_vae.simple_encoder import (
     SimpleVideoEncoder,
@@ -840,6 +847,11 @@ def generate_video(
     control_strength: float = 0.95,
     save_control: bool = False,
     ge_gamma: float = 0.0,
+    output_fps: int = 24,
+    output_speed: float = 1.0,
+    # IC-LoRA and Keyframe Interpolation
+    keyframes: list = None,
+    ic_lora_weights: str = None,
 ):
     """Generate video from text prompt."""
 
@@ -1143,6 +1155,8 @@ def generate_video(
 
         print("\n=== Using Two-Stage Pipeline ===")
         print(f"  Stage 1: {steps_stage1} steps at {height//2}x{width//2} with CFG {cfg_stage1 or cfg_scale}")
+        if guidance_rescale > 0:
+            print(f"  Guidance rescale: {guidance_rescale}")
         print(f"  Stage 2: 3 steps at {height}x{width} (distilled refinement)")
 
         # Load spatial upscaler
@@ -1191,6 +1205,7 @@ def generate_video(
             fps=24.0,
             num_inference_steps=steps_stage1,
             cfg_scale=cfg_stage1 if cfg_stage1 is not None else cfg_scale,
+            guidance_rescale=guidance_rescale,
             dtype=compute_dtype,
             distilled_lora_config=distilled_lora_config,
         )
@@ -1207,7 +1222,7 @@ def generate_video(
 
         # Run pipeline
         print(f"\n[5/5] Running two-stage generation...")
-        video = pipeline(
+        video, _ = pipeline(
             positive_encoding=text_encoding,
             negative_encoding=null_encoding,
             config=config,
@@ -1222,7 +1237,214 @@ def generate_video(
 
         # Save video
         print(f"\nSaving video to {output_path}...")
-        save_video(frames, output_path, fps=8)
+        save_video(frames, output_path, fps=output_fps, speed=output_speed)
+        print(f"Done! Video saved to {output_path}")
+        return
+
+    # === IC-LORA PIPELINE ===
+    # Use ICLoraPipeline for video-to-video or image-to-video generation with control signals
+    if pipeline_type == "ic-lora":
+        if not control_video and not image_path:
+            raise ValueError("IC-LoRA pipeline requires --control-video or --image argument")
+
+        print("\n=== Using IC-LoRA Pipeline ===")
+        if control_video:
+            print(f"  Control video: {control_video}")
+            print(f"  Control type: {control_type}")
+            print(f"  Control strength: {control_strength}")
+        if image_path:
+            print(f"  Image conditioning: {image_path} (strength={image_strength})")
+
+        if model is None:
+            if use_placeholder:
+                print("  IC-LoRA requires model - cannot use placeholder mode")
+                return
+            raise ValueError("IC-LoRA pipeline requires a loaded model")
+
+        if vae_decoder is None and not use_placeholder:
+            raise ValueError("IC-LoRA pipeline requires VAE decoder")
+
+        # Load VAE encoder
+        print("[3.5/5] Loading VAE encoder...")
+        video_encoder = SimpleVideoEncoder(compute_dtype=compute_dtype)
+        if weights_path and not use_placeholder:
+            load_vae_encoder_weights(video_encoder, weights_path)
+        else:
+            print("  Skipping weights load (placeholder)")
+
+        # Load spatial upscaler
+        print("[3.6/5] Loading spatial upscaler...")
+        spatial_upscaler = SpatialUpscaler()
+        upscaler_path = spatial_upscaler_weights or "weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        if os.path.exists(upscaler_path):
+            load_spatial_upscaler_weights(spatial_upscaler, upscaler_path)
+        else:
+            print(f"  Warning: Spatial upscaler weights not found at {upscaler_path}")
+
+        # Get base transformer weights for restoration after stage 1
+        if hasattr(model, 'velocity_model'):
+            base_weights = dict(tree_flatten(model.velocity_model.parameters()))
+        else:
+            base_weights = dict(tree_flatten(model.parameters()))
+
+        # Prepare LoRA configs if provided
+        lora_configs = None
+        if ic_lora_weights:
+            print(f"  IC-LoRA weights: {ic_lora_weights}")
+            lora_configs = [LoRAConfig(path=ic_lora_weights, strength=1.0)]
+
+        # Create IC-LoRA pipeline
+        print("\n[4/5] Creating IC-LoRA pipeline...")
+        ic_pipeline = ICLoraPipeline(
+            transformer=model,
+            video_encoder=video_encoder,
+            video_decoder=vae_decoder,
+            spatial_upscaler=spatial_upscaler,
+            base_transformer_weights=base_weights,
+            lora_configs=lora_configs,
+        )
+
+        # Create config
+        config = ICLoraConfig(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            fps=24.0,
+            stage_1_steps=num_steps,
+            dtype=compute_dtype,
+        )
+
+        # Create video conditioning if control video provided
+        video_conditioning = []
+        if control_video:
+            ctrl_type = ControlType.CANNY if control_type == "canny" else ControlType.RAW
+            video_cond = VideoCondition(
+                video_path=control_video,
+                strength=control_strength,
+                control_type=ctrl_type,
+                canny_low=canny_low,
+                canny_high=canny_high,
+                save_control=save_control,
+            )
+            video_conditioning = [video_cond]
+
+        # Create image conditioning if provided (IC-LoRA supports both video and image conditioning)
+        images = []
+        if image_path:
+            images = [ImageCondition(
+                image_path=image_path,
+                frame_index=0,
+                strength=image_strength,
+            )]
+
+        # Run pipeline
+        print(f"\n[5/5] Running IC-LoRA generation...")
+        video = ic_pipeline(
+            text_encoding=text_encoding,
+            text_mask=mx.ones((1, text_encoding.shape[1]), dtype=mx.int32),
+            config=config,
+            images=images,
+            video_conditioning=video_conditioning,
+        )
+
+        # Convert to frames
+        video_np = np.array(video)
+        frames = [video_np[t] for t in range(video_np.shape[0])]
+        print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
+
+        # Save video
+        print(f"\nSaving video to {output_path}...")
+        save_video(frames, output_path, fps=output_fps, speed=output_speed)
+        print(f"Done! Video saved to {output_path}")
+        return
+
+    # === KEYFRAME INTERPOLATION PIPELINE ===
+    # Use KeyframeInterpolationPipeline for interpolating between keyframe images
+    if pipeline_type == "keyframe-interpolation":
+        if not keyframes:
+            raise ValueError("Keyframe interpolation pipeline requires --keyframe arguments")
+
+        print("\n=== Using Keyframe Interpolation Pipeline ===")
+
+        # Parse keyframes
+        parsed_keyframes = []
+        for kf_str in keyframes:
+            parts = kf_str.split(":")
+            if len(parts) < 2:
+                raise ValueError(f"Invalid keyframe format: {kf_str}. Use 'path:frame_index' or 'path:frame_index:strength'")
+            path = parts[0]
+            frame_idx = int(parts[1])
+            strength = float(parts[2]) if len(parts) > 2 else 0.95
+            parsed_keyframes.append(Keyframe(image_path=path, frame_index=frame_idx, strength=strength))
+            print(f"  Keyframe: {path} at frame {frame_idx} (strength={strength})")
+
+        if model is None:
+            if use_placeholder:
+                print("  Keyframe interpolation requires model - cannot use placeholder mode")
+                return
+            raise ValueError("Keyframe interpolation pipeline requires a loaded model")
+
+        if vae_decoder is None and not use_placeholder:
+            raise ValueError("Keyframe interpolation pipeline requires VAE decoder")
+
+        # Load VAE encoder
+        print("[3.5/5] Loading VAE encoder...")
+        video_encoder = SimpleVideoEncoder(compute_dtype=compute_dtype)
+        if weights_path and not use_placeholder:
+            load_vae_encoder_weights(video_encoder, weights_path)
+        else:
+            print("  Skipping weights load (placeholder)")
+
+        # Load spatial upscaler for two-stage
+        print("[3.6/5] Loading spatial upscaler...")
+        spatial_upscaler = SpatialUpscaler()
+        upscaler_path = spatial_upscaler_weights or "weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors"
+        if os.path.exists(upscaler_path):
+            load_spatial_upscaler_weights(spatial_upscaler, upscaler_path)
+        else:
+            print(f"  Warning: Spatial upscaler weights not found at {upscaler_path}")
+
+        # Create keyframe interpolation pipeline
+        print("\n[4/5] Creating keyframe interpolation pipeline...")
+        kf_pipeline = KeyframeInterpolationPipeline(
+            transformer=model,
+            video_encoder=video_encoder,
+            video_decoder=vae_decoder,
+            spatial_upscaler=spatial_upscaler,
+        )
+
+        # Create config
+        config = KeyframeInterpolationConfig(
+            height=height,
+            width=width,
+            num_frames=num_frames,
+            seed=seed,
+            fps=24.0,
+            num_inference_steps=num_steps,
+            cfg_scale=cfg_scale,
+            dtype=compute_dtype,
+        )
+
+        # Run pipeline
+        print(f"\n[5/5] Running keyframe interpolation ({num_steps} steps)...")
+        video = kf_pipeline(
+            text_encoding=text_encoding,
+            text_mask=mx.ones((1, text_encoding.shape[1]), dtype=mx.int32),
+            keyframes=parsed_keyframes,
+            config=config,
+            negative_text_encoding=null_encoding,
+            negative_text_mask=mx.ones((1, null_encoding.shape[1]), dtype=mx.int32),
+        )
+
+        # Convert to frames
+        video_np = np.array(video)
+        frames = [video_np[t] for t in range(video_np.shape[0])]
+        print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
+
+        # Save video
+        print(f"\nSaving video to {output_path}...")
+        save_video(frames, output_path, fps=output_fps, speed=output_speed)
         print(f"Done! Video saved to {output_path}")
         return
 
@@ -1320,9 +1542,9 @@ def generate_video(
         # Save video with audio
         print(f"\nSaving video to {output_path}...")
         if audio_waveform is not None:
-            save_video_with_audio(frames, audio_waveform, output_path, fps=24)
+            save_video_with_audio(frames, audio_waveform, output_path, fps=output_fps, speed=output_speed)
         else:
-            save_video(frames, output_path, fps=24)
+            save_video(frames, output_path, fps=output_fps, speed=output_speed)
         print(f"Done! Video saved to {output_path}")
         return
 
@@ -1702,7 +1924,7 @@ def generate_video(
     # Save video
     # Note: Audio generation is handled by the AUDIO-VIDEO PIPELINE section above
     print(f"\nSaving video to {output_path}...")
-    save_video(frames, output_path, fps=24)
+    save_video(frames, output_path, fps=output_fps, speed=output_speed)
 
     print(f"\nDone! Video saved to {output_path}")
 
@@ -1715,11 +1937,20 @@ def generate_video(
         print("\nNote: VAE decoder was not loaded - output is placeholder visualization.")
 
 
-def save_video(frames: list, output_path: str, fps: int = 24):
-    """Save frames as video using ffmpeg."""
+def save_video(frames: list, output_path: str, fps: int = 24, speed: float = 1.0):
+    """Save frames as video using ffmpeg with optional interpolation and speed adjustment.
+
+    Args:
+        frames: List of frame arrays (H, W, C) in uint8.
+        output_path: Output video file path.
+        fps: Target output frame rate. If >24, uses motion interpolation.
+        speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
+    """
     import subprocess
     import tempfile
     from PIL import Image
+
+    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1734,18 +1965,48 @@ def save_video(frames: list, output_path: str, fps: int = 24):
             img = Image.fromarray(frame)
             img.save(os.path.join(tmpdir, f"frame_{i:04d}.png"))
 
-        # Use ffmpeg to create video
+        # Build ffmpeg filter chain
+        filters = []
+
+        # Speed adjustment (applied first, before interpolation)
+        # setpts: lower value = faster, higher value = slower
+        if speed != 1.0:
+            # speed=2.0 means 2x faster, so PTS should be halved
+            pts_multiplier = 1.0 / speed
+            filters.append(f"setpts={pts_multiplier}*PTS")
+
+        # Frame interpolation if target fps > native
+        if fps > NATIVE_FPS:
+            # minterpolate creates smooth intermediate frames
+            # mi_mode=mci: motion compensated interpolation
+            # mc_mode=aobmc: adaptive overlapped block motion compensation
+            # me_mode=bidir: bidirectional motion estimation
+            filters.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+
+        # Build ffmpeg command
         print("\n  Encoding video...")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(fps),
+            "-framerate", str(NATIVE_FPS),  # Input is always at native 24fps
             "-i", os.path.join(tmpdir, "frame_%04d.png"),
+        ]
+
+        # Add filter chain if needed
+        if filters:
+            filter_str = ",".join(filters)
+            cmd.extend(["-vf", filter_str])
+            if fps > NATIVE_FPS:
+                print(f"  Interpolating {NATIVE_FPS}fps → {fps}fps (speed: {speed}x)")
+            elif speed != 1.0:
+                print(f"  Applying speed: {speed}x")
+
+        cmd.extend([
             "-c:v", "libx264",
             "-pix_fmt", "yuv420p",
             "-crf", "18",
             "-loglevel", "error",
             output_path
-        ]
+        ])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1758,13 +2019,25 @@ def save_video_with_audio(
     audio_waveform: mx.array,
     output_path: str,
     fps: int = 24,
+    speed: float = 1.0,
     audio_sample_rate: int = 24000,
 ):
-    """Save frames as video with audio using ffmpeg."""
+    """Save frames as video with audio using ffmpeg with optional interpolation and speed.
+
+    Args:
+        frames: List of frame arrays (H, W, C) in uint8.
+        audio_waveform: Audio waveform tensor (B, 2, samples).
+        output_path: Output video file path.
+        fps: Target output frame rate. If >24, uses motion interpolation.
+        speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
+        audio_sample_rate: Audio sample rate in Hz.
+    """
     import subprocess
     import tempfile
     import wave
     from PIL import Image
+
+    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames and audio
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -1802,13 +2075,54 @@ def save_video_with_audio(
 
         print(f"    Audio: {len(audio_flat) // 2} samples, {len(audio_flat) // 2 / audio_sample_rate:.2f}s")
 
-        # Use ffmpeg to create video with audio
+        # Build video filter chain
+        video_filters = []
+
+        # Speed adjustment for video (applied first, before interpolation)
+        if speed != 1.0:
+            pts_multiplier = 1.0 / speed
+            video_filters.append(f"setpts={pts_multiplier}*PTS")
+
+        # Frame interpolation if target fps > native
+        if fps > NATIVE_FPS:
+            video_filters.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
+
+        # Build audio filter chain for speed adjustment
+        # atempo filter range is 0.5-2.0, so chain multiple for extreme speeds
+        audio_filters = []
+        if speed != 1.0:
+            remaining_speed = speed
+            while remaining_speed > 2.0:
+                audio_filters.append("atempo=2.0")
+                remaining_speed /= 2.0
+            while remaining_speed < 0.5:
+                audio_filters.append("atempo=0.5")
+                remaining_speed /= 0.5
+            if remaining_speed != 1.0:
+                audio_filters.append(f"atempo={remaining_speed}")
+
+        # Build ffmpeg command
         print("\n  Encoding video with audio...")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(fps),
+            "-framerate", str(NATIVE_FPS),  # Input is always at native 24fps
             "-i", os.path.join(tmpdir, "frame_%04d.png"),
             "-i", audio_path,
+        ]
+
+        # Add video filter chain if needed
+        if video_filters:
+            cmd.extend(["-vf", ",".join(video_filters)])
+            if fps > NATIVE_FPS:
+                print(f"  Interpolating {NATIVE_FPS}fps → {fps}fps (speed: {speed}x)")
+            elif speed != 1.0:
+                print(f"  Applying speed: {speed}x")
+
+        # Add audio filter chain if needed
+        if audio_filters:
+            cmd.extend(["-af", ",".join(audio_filters)])
+
+        cmd.extend([
             "-c:v", "libx264",
             "-c:a", "aac",
             "-pix_fmt", "yuv420p",
@@ -1816,7 +2130,7 @@ def save_video_with_audio(
             "-shortest",  # Use shortest duration (video or audio)
             "-loglevel", "error",
             output_path
-        ]
+        ])
 
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode != 0:
@@ -1837,6 +2151,8 @@ def main():
     parser.add_argument("--steps-stage2", type=int, default=3, help="Stage 2 refinement steps for two-stage pipeline")
     parser.add_argument("--cfg-stage1", type=float, default=None, help="Stage 1 CFG (defaults to --cfg value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
+    parser.add_argument("--fps", type=int, default=24, help="Output video frame rate (default: 24). If >24, uses frame interpolation.")
+    parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast)")
     parser.add_argument("--output", type=str, default="outputs/output.mp4", help="Output path")
     parser.add_argument(
         "--weights",
@@ -2060,9 +2376,24 @@ def main():
     parser.add_argument(
         "--pipeline",
         type=str,
-        choices=["text-to-video", "distilled", "one-stage", "two-stage"],
+        choices=["text-to-video", "distilled", "one-stage", "two-stage", "ic-lora", "keyframe-interpolation"],
         default="text-to-video",
         help="Pipeline type (default: text-to-video)"
+    )
+    # Keyframe interpolation arguments
+    parser.add_argument(
+        "--keyframe",
+        type=str,
+        action="append",
+        default=None,
+        help="Keyframe image in format 'path:frame_index' or 'path:frame_index:strength'. Can be specified multiple times."
+    )
+    # IC-LoRA arguments
+    parser.add_argument(
+        "--ic-lora-weights",
+        type=str,
+        default=None,
+        help="Path to IC-LoRA weights for video-to-video generation"
     )
     parser.add_argument(
         "--early-layers-only",
@@ -2162,6 +2493,12 @@ def main():
         save_control=args.save_control,
         # GE (Gradient Estimation) parameter
         ge_gamma=args.ge_gamma,
+        # Output FPS and speed
+        output_fps=args.fps,
+        output_speed=args.speed,
+        # IC-LoRA and Keyframe Interpolation
+        keyframes=args.keyframe,
+        ic_lora_weights=args.ic_lora_weights,
     )
 
 

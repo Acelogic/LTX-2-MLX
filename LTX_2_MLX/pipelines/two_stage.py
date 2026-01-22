@@ -45,6 +45,39 @@ from ..types import (
 )
 
 
+def rescale_noise_cfg(
+    noise_cfg: mx.array,
+    noise_cond: mx.array,
+    guidance_rescale: float = 0.7,
+) -> mx.array:
+    """
+    Rescale CFG output to prevent variance explosion.
+
+    Based on "Common Diffusion Noise Schedules and Sample Steps are Flawed"
+    (https://arxiv.org/abs/2305.08891). This rescales the CFG output to match
+    the variance of the conditioned prediction, preventing oversaturation.
+
+    Args:
+        noise_cfg: CFG-guided prediction.
+        noise_cond: Conditioned prediction (no CFG).
+        guidance_rescale: Blend factor (0=no rescale, 1=full rescale).
+
+    Returns:
+        Rescaled CFG prediction.
+    """
+    # Get statistics
+    cfg_std = noise_cfg.std()
+    cfg_mean = noise_cfg.mean()
+    cond_std = noise_cond.std()
+    cond_mean = noise_cond.mean()
+
+    # Rescale CFG output to match conditioned prediction's statistics
+    noise_pred_rescaled = (noise_cfg - cfg_mean) / (cfg_std + 1e-8) * cond_std + cond_mean
+
+    # Blend between original and rescaled
+    return guidance_rescale * noise_pred_rescaled + (1 - guidance_rescale) * noise_cfg
+
+
 @dataclass
 class TwoStageCFGConfig:
     """Configuration for two-stage CFG pipeline."""
@@ -61,6 +94,7 @@ class TwoStageCFGConfig:
 
     # CFG parameters (for stage 1)
     cfg_scale: float = 3.0
+    guidance_rescale: float = 0.7  # Rescale CFG to prevent variance explosion (0=off, 0.7=default)
 
     # LoRA config for stage 2 (distilled refinement)
     distilled_lora_config: Optional[LoRAConfig] = None
@@ -202,6 +236,7 @@ class TwoStagePipeline:
         negative_context: mx.array,
         guider: CFGGuider,
         stepper: EulerDiffusionStep,
+        guidance_rescale: float = 0.0,
         callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> LatentState:
         """Run the denoising loop with CFG guidance (Stage 1)."""
@@ -225,6 +260,10 @@ class TwoStagePipeline:
 
                 # Apply CFG guidance
                 denoised = guider.guide(pos_denoised, neg_denoised)
+
+                # Apply guidance rescale to prevent variance explosion
+                if guidance_rescale > 0:
+                    denoised = rescale_noise_cfg(denoised, pos_denoised, guidance_rescale)
             else:
                 denoised = pos_denoised
 
@@ -259,6 +298,7 @@ class TwoStagePipeline:
         negative_audio_context: mx.array,
         guider: CFGGuider,
         stepper: EulerDiffusionStep,
+        guidance_rescale: float = 0.0,
         callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Tuple[LatentState, LatentState]:
         """
@@ -274,6 +314,7 @@ class TwoStagePipeline:
             negative_audio_context: Negative text context for audio.
             guider: CFG guider instance.
             stepper: Diffusion stepper.
+            guidance_rescale: Rescale factor to prevent variance explosion.
             callback: Optional callback(stage, step, total_steps).
 
         Returns:
@@ -313,6 +354,11 @@ class TwoStagePipeline:
                 # Apply CFG guidance to both modalities
                 video_denoised = guider.guide(pos_video_denoised, neg_video_denoised)
                 audio_denoised = guider.guide(pos_audio_denoised, neg_audio_denoised)
+
+                # Apply guidance rescale to prevent variance explosion
+                if guidance_rescale > 0:
+                    video_denoised = rescale_noise_cfg(video_denoised, pos_video_denoised, guidance_rescale)
+                    audio_denoised = rescale_noise_cfg(audio_denoised, pos_audio_denoised, guidance_rescale)
             else:
                 video_denoised = pos_video_denoised
                 audio_denoised = pos_audio_denoised
@@ -564,6 +610,7 @@ class TwoStagePipeline:
                 negative_audio_context=negative_audio_encoding,
                 guider=guider,
                 stepper=stepper,
+                guidance_rescale=config.guidance_rescale,
                 callback=callback,
             )
         else:
@@ -575,6 +622,7 @@ class TwoStagePipeline:
                 negative_context=negative_encoding,
                 guider=guider,
                 stepper=stepper,
+                guidance_rescale=config.guidance_rescale,
                 callback=callback,
             )
 
@@ -591,34 +639,19 @@ class TwoStagePipeline:
 
         # ====== STAGE 2: Upsample video and refine with distilled LoRA ======
         # Note: Audio doesn't need spatial upscaling, but we still refine it with video
-        # Upsample the video latent 2x
         # CRITICAL: Must un-normalize before upsampling, then re-normalize after
-        # This is required by the PyTorch reference implementation to preserve latent distribution
+        # This preserves the latent distribution through the upsampling process
+        print("  Upsampling latent 2x with spatial upscaler...")
+        # Un-normalize before upscaling (upscaler was trained on un-normalized latents)
         latent_unnorm = self.video_encoder.per_channel_statistics.un_normalize(stage_1_video_latent)
 
-        # Use nearest neighbor upsampling (vectorized for performance)
-        # Vectorized implementation: ~2-3x faster than frame-by-frame loop
-        b, c, f, h, w = latent_unnorm.shape
-
-        # Reshape to process all frames at once: (B, C, F, H, W) -> (B*F, C, H, W)
-        latent_flat = latent_unnorm.transpose(0, 2, 1, 3, 4)  # (B, F, C, H, W)
-        latent_flat = latent_flat.reshape(b * f, c, h, w)  # (B*F, C, H, W)
-
-        # Transpose for upsampling: (B*F, C, H, W) -> (B*F, H, W, C)
-        latent_flat = latent_flat.transpose(0, 2, 3, 1)
-
-        # Vectorized nearest neighbor 2x upsampling
-        upscaled_flat = mx.repeat(mx.repeat(latent_flat, 2, axis=1), 2, axis=2)  # (B*F, H*2, W*2, C)
-
-        # Transpose back: (B*F, H*2, W*2, C) -> (B*F, C, H*2, W*2)
-        upscaled_flat = upscaled_flat.transpose(0, 3, 1, 2)
-
-        # Reshape back to original structure: (B*F, C, H*2, W*2) -> (B, C, F, H*2, W*2)
-        upscaled_flat = upscaled_flat.reshape(b, f, c, h * 2, w * 2)  # (B, F, C, H*2, W*2)
-        upscaled_unnorm = upscaled_flat.transpose(0, 2, 1, 3, 4)  # (B, C, F, H*2, W*2)
+        # Apply learned spatial 2x upscaler
+        upscaled_unnorm = self.spatial_upscaler(latent_unnorm)
+        mx.eval(upscaled_unnorm)
 
         # Re-normalize back to latent space
         upscaled_video_latent = self.video_encoder.per_channel_statistics.normalize(upscaled_unnorm)
+        mx.eval(upscaled_video_latent)
 
         # Apply distilled LoRA if provided
         if config.distilled_lora_config is not None:
