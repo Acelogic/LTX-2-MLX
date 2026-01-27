@@ -371,6 +371,11 @@ def load_transformer_weights(
             if not pytorch_key.startswith("model.diffusion_model."):
                 continue
 
+            # Fix: skip audio weights (issue #6)
+            if "audio" in pytorch_key or "a2v" in pytorch_key:
+                skipped_count += 1
+                continue
+
             # Remove prefix
             key = pytorch_key.replace("model.diffusion_model.", "")
 
