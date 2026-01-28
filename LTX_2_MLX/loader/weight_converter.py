@@ -289,12 +289,12 @@ def convert_pytorch_key_to_mlx(pytorch_key: str, include_audio: bool = False) ->
 
     # Skip audio/video cross-attention keys unless explicitly included
     if not include_audio:
-        if "av_ca" in key or "audio" in key.lower():
+        if "av_ca" in key or "a2v" in key or "audio" in key.lower():
             return None
 
-    # Skip video_embeddings_connector - these are text encoder weights loaded separately
+    # Skip embeddings connectors - these are text encoder weights loaded separately
     # via load_text_encoder_weights(), not part of the transformer model
-    if "video_embeddings_connector" in key:
+    if "video_embeddings_connector" in key or "audio_embeddings_connector" in key:
         return None
 
     # Handle to_out.0 -> to_out (PyTorch Sequential vs MLX direct)
@@ -369,11 +369,6 @@ def load_transformer_weights(
         for pytorch_key in key_iter:
             # Only process diffusion model keys
             if not pytorch_key.startswith("model.diffusion_model."):
-                continue
-
-            # Fix: skip audio weights (issue #6)
-            if "audio" in pytorch_key or "a2v" in pytorch_key:
-                skipped_count += 1
                 continue
 
             # Remove prefix

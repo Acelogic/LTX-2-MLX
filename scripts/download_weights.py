@@ -28,7 +28,7 @@ import os
 from pathlib import Path
 from typing import Optional
 
-from huggingface_hub import hf_hub_download, login, snapshot_download
+from huggingface_hub import get_token, hf_hub_download, login, snapshot_download
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
@@ -42,7 +42,7 @@ WEIGHTS = {
         "name": "LTX-2 19B Distilled",
         "description": "Fast generation (8 steps), recommended for most users",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5.safetensors",
+        "filename": "ltx-2-19b-distilled.safetensors",
         "local_path": "weights/ltx-2/ltx-2-19b-distilled.safetensors",
         "size": "~43GB",
         "required": True,
@@ -51,7 +51,7 @@ WEIGHTS = {
         "name": "LTX-2 19B Distilled (FP8)",
         "description": "Quantized version, smaller download (~27GB)",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5-fp8.safetensors",
+        "filename": "ltx-2-19b-distilled-fp8.safetensors",
         "local_path": "weights/ltx-2/ltx-2-19b-distilled-fp8.safetensors",
         "size": "~27GB",
         "required": False,
@@ -60,16 +60,25 @@ WEIGHTS = {
         "name": "LTX-2 19B Dev",
         "description": "Higher quality (25-50 steps), slower generation",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5-dev.safetensors",
+        "filename": "ltx-2-19b-dev.safetensors",
         "local_path": "weights/ltx-2/ltx-2-19b-dev.safetensors",
         "size": "~43GB",
+        "required": False,
+    },
+    "dev-fp8": {
+        "name": "LTX-2 19B Dev (FP8)",
+        "description": "Quantized dev version, smaller download",
+        "repo": "Lightricks/LTX-2",
+        "filename": "ltx-2-19b-dev-fp8.safetensors",
+        "local_path": "weights/ltx-2/ltx-2-19b-dev-fp8.safetensors",
+        "size": "~27GB",
         "required": False,
     },
     "spatial": {
         "name": "Spatial Upscaler 2x",
         "description": "2x resolution upscaling (256->512, 512->1024)",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5-spatial-upscaler-2x.safetensors",
+        "filename": "ltx-2-spatial-upscaler-x2-1.0.safetensors",
         "local_path": "weights/ltx-2/ltx-2-spatial-upscaler-x2-1.0.safetensors",
         "size": "~995MB",
         "required": False,
@@ -78,7 +87,7 @@ WEIGHTS = {
         "name": "Temporal Upscaler 2x",
         "description": "2x framerate upscaling (17->33 frames, etc.)",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5-temporal-upscaler-2x.safetensors",
+        "filename": "ltx-2-temporal-upscaler-x2-1.0.safetensors",
         "local_path": "weights/ltx-2/ltx-2-temporal-upscaler-x2-1.0.safetensors",
         "size": "~262MB",
         "required": False,
@@ -87,7 +96,7 @@ WEIGHTS = {
         "name": "Distilled LoRA",
         "description": "LoRA for Stage 2 refinement in two-stage pipeline",
         "repo": "Lightricks/LTX-2",
-        "filename": "ltx-video-2b-v0.9.5-distilled-lora-384.safetensors",
+        "filename": "ltx-2-19b-distilled-lora-384.safetensors",
         "local_path": "weights/ltx-2/ltx-2-19b-distilled-lora-384.safetensors",
         "size": "~1.5GB",
         "required": False,
@@ -258,10 +267,16 @@ def download_weights(selected: set[str], token: Optional[str] = None):
         console.print("  https://huggingface.co/google/gemma-3-12b-it")
         console.print()
         if not token:
-            console.print("[yellow]You may need a HuggingFace token for Gemma.[/yellow]")
-            token = Prompt.ask("Enter HuggingFace token (or press Enter to skip)", default="")
-            if token:
-                login(token=token)
+            # Check for stored token first
+            stored_token = get_token()
+            if stored_token:
+                console.print("[green]Using stored HuggingFace credentials.[/green]")
+                token = stored_token
+            elif os.isatty(0):  # Only prompt if running interactively
+                console.print("[yellow]You may need a HuggingFace token for Gemma.[/yellow]")
+                token = Prompt.ask("Enter HuggingFace token (or press Enter to skip)", default="")
+                if token:
+                    login(token=token)
             console.print()
 
     success = []

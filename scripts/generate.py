@@ -1516,12 +1516,13 @@ def generate_video(
         )
 
         # Create config with audio enabled
+        # NOTE: fps=25.0 matches PyTorch's default frame_rate for audio latent calculations
         av_config = OneStageCFGConfig(
             height=height,
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=25.0,  # Must match PyTorch's default frame_rate for audio parity
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             dtype=compute_dtype,
