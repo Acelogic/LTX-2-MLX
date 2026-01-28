@@ -55,7 +55,7 @@ class OneStageCFGConfig:
 
     # Generation parameters
     seed: int = 42
-    fps: float = 24.0
+    fps: float = 25.0  # Match PyTorch default frame_rate for audio latent calculations
     num_inference_steps: int = 30
 
     # CFG parameters
