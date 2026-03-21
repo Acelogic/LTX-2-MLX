@@ -1046,6 +1046,13 @@ def generate_video(
     # Set seed
     mx.random.seed(seed)
 
+    # Validate num_frames constraint (must be 8k + 1 for VAE temporal compression)
+    if num_frames % 8 != 1:
+        nearest_valid = ((num_frames - 1 + 4) // 8) * 8 + 1  # Round to nearest valid
+        print(f"  WARNING: num_frames must be 8*k + 1 (e.g., 1, 9, 17, 25, ..., 97, 121).")
+        print(f"  Got {num_frames}, adjusting to {nearest_valid}.")
+        num_frames = nearest_valid
+
     # Compute latent dimensions
     # VAE: 32x spatial, 8x temporal compression
     latent_height = height // 32
