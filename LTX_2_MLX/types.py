@@ -1,5 +1,6 @@
 """Type definitions for LTX-2 MLX."""
 
+import math
 from dataclasses import dataclass
 from typing import NamedTuple, Tuple
 

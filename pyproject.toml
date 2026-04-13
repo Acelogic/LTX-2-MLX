@@ -37,6 +37,10 @@ dependencies = [
     "sentencepiece>=0.2.1",
     "protobuf>=6.33.3",
     "torch>=2.9.1",
+    "fastapi>=0.135.2",
+    "uvicorn[standard]>=0.42.0",
+    "python-multipart>=0.0.22",
+    "pydantic>=2.12.5",
 ]
 
 [project.optional-dependencies]

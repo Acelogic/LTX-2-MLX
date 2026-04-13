@@ -371,9 +371,9 @@ class AudioDecoder(nn.Module):
         Returns:
             Mel spectrogram (B, out_ch, frames*4, mel_bins)
         """
-        # Cast to compute dtype
-        if self.compute_dtype != mx.float32:
-            sample = sample.astype(self.compute_dtype)
+        # Always decode in fp32 — audio decoder feeds vocoder which has 108
+        # sequential convolutions where bf16 accumulation errors compound
+        sample = sample.astype(mx.float32)
 
         # Denormalize latents first (matching PyTorch)
         sample = self._denormalize_latents(sample)
@@ -413,11 +413,8 @@ class AudioDecoder(nn.Module):
         # Adjust output shape to target (frames are upsampled 4x, mel bins are upsampled 4x)
         # Output shape: (B, out_ch, frames_upsampled, mel_bins_upsampled)
         target_mel = f * LATENT_DOWNSAMPLE_FACTOR  # 16 * 4 = 64
-        h = h[:, :self.out_ch, :target_frames, :target_mel]
 
-        # Cast back to float32
-        if self.compute_dtype != mx.float32:
-            h = h.astype(mx.float32)
+        h = h[:, :self.out_ch, :target_frames, :target_mel]
 
         return h
 

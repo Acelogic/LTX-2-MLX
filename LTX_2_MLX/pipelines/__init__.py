@@ -80,4 +80,18 @@ __all__ = [
     "TwoStagePipeline",
     "TwoStageImageCondition",
     "create_two_stage_pipeline",
+    # HQ Two-Stage (Res2s)
+    "TI2VidHQConfig",
+    "TI2VidHQPipeline",
+    # Retake
+    "RetakeConfig",
+    "RetakePipeline",
+    "TemporalRegionMask",
+    # Audio-to-Video
+    "A2VidConfig",
+    "A2VidPipelineTwoStage",
 ]
+
+from .ti2vid_hq import TI2VidHQConfig, TI2VidHQPipeline
+from .retake import RetakeConfig, RetakePipeline, TemporalRegionMask
+from .a2vid_two_stage import A2VidConfig, A2VidPipelineTwoStage

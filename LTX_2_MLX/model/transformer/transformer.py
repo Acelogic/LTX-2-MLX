@@ -219,6 +219,10 @@ class BasicTransformerBlock(nn.Module):
             context=args.context,
             mask=args.context_mask,
         )
+        # Optional per-block cross-attention scaling (set externally)
+        ca_scale = getattr(self, '_cross_attn_scale', None)
+        if ca_scale is not None:
+            cross_out = cross_out * ca_scale
         x = x + cross_out
 
         # Get AdaLN values for FFN
@@ -518,6 +522,10 @@ class BasicAVTransformerBlock(nn.Module):
                 video.timesteps, video.prompt_timestep,
                 video.context_mask,
             )
+            # Optional per-block cross-attention scaling (set externally)
+            ca_scale = getattr(self, '_cross_attn_scale', None)
+            if ca_scale is not None:
+                cross_out = cross_out * ca_scale
             vx = vx + cross_out
 
         # Audio self-attention + cross-attention to text

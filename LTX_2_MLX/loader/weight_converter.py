@@ -385,7 +385,8 @@ def load_transformer_weights(
             import torch
 
             # Determine target torch dtype for memory efficiency
-            torch_target = torch.float16 if target_dtype == "float16" else torch.float32
+            torch_dtype_map = {"float16": torch.float16, "bfloat16": torch.bfloat16}
+            torch_target = torch_dtype_map.get(target_dtype, torch.float32)
 
             # Handle FP8 quantized weights
             if use_fp8 and pytorch_key in fp8_scales:
@@ -403,8 +404,13 @@ def load_transformer_weights(
                 tensor = tensor.to(torch_target)
 
             # Convert to MLX array
-            np_array = tensor.numpy()
-            value = mx.array(np_array)
+            # numpy doesn't support bfloat16, so convert via float32 then cast in MLX
+            if tensor.dtype == torch.bfloat16:
+                np_array = tensor.to(torch.float32).numpy()
+                value = mx.array(np_array).astype(mx.bfloat16)
+            else:
+                np_array = tensor.numpy()
+                value = mx.array(np_array)
 
             # MEMORY OPTIMIZATION: Delete torch tensor and numpy array immediately
             # This prevents double memory usage during weight loading

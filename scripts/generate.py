@@ -103,7 +103,7 @@ from LTX_2_MLX.model.text_encoder.encoder import (
     load_text_encoder_weights,
     create_av_text_encoder,
     load_av_text_encoder_weights,
-    create_av_text_encoder_v2,
+    create_av_text_encoder_v2_from_checkpoint,
     load_av_text_encoder_v2_weights,
 )
 from LTX_2_MLX.model.upscaler import (
@@ -285,17 +285,22 @@ def _simple_progress(iterable, desc, total):
 T2V_SYSTEM_PROMPT = """Describe the video in extreme detail, focusing on the visual content, without any introductory phrases."""
 
 # System prompt for prompt enhancement (used to expand short prompts into detailed descriptions)
-ENHANCE_SYSTEM_PROMPT = """You are a creative assistant that transforms simple video descriptions into detailed, vivid prompts for video generation.
+ENHANCE_SYSTEM_PROMPT = """You enhance short video descriptions into detailed prompts for a video generation model. You MUST preserve the exact subject, characters, and scene from the original — never replace or reinterpret them.
 
-Given a brief description, expand it into a rich, detailed paragraph (100-200 words) that includes:
-- Specific visual details (colors, textures, lighting)
-- Motion and action descriptions (speed, direction, style)
-- Environment and atmosphere details
-- Camera perspective if relevant
+Write a single flowing paragraph (4-8 sentences, present tense) covering these elements in order:
 
-Keep the description in natural, flowing language. Focus only on visual elements.
-Do not add dialogue or sound descriptions unless specifically mentioned.
-Output only the enhanced description, nothing else."""
+1. SHOT: Cinematography term (wide shot, close-up, medium shot, tracking shot, etc.)
+2. SCENE: Lighting, color palette, textures, atmosphere, mood
+3. ACTION: The core motion described as a natural sequence from beginning to end
+4. CHARACTER(S): Physical appearance, distinguishing features, emotion through physical cues (not labels)
+5. CAMERA: How and when the camera moves, what appears after the movement
+6. AUDIO: Ambient sound, music, or speech (put dialogue in quotation marks)
+
+CRITICAL RULES:
+- If the original says "frog" you write about a frog. If it says "robot" you write about a robot. NEVER substitute the subject.
+- Use present tense verbs for action and movement
+- Match detail level to shot scale (close-ups need more detail than wide shots)
+- Output ONLY the enhanced paragraph, nothing else."""
 
 
 def load_tokenizer(model_path: str):
@@ -324,68 +329,12 @@ def enhance_prompt(
     temperature: float = 0.7,
 ) -> str:
     """
-    Enhance a short prompt into a detailed description using Gemma generation.
-
-    The official LTX-2 pipeline uses this to expand simple prompts like "A blue ball"
-    into rich descriptions with visual details, creating more differentiated embeddings.
-
-    Args:
-        prompt: Short user prompt to enhance.
-        gemma_path: Path to Gemma 3 weights directory.
-        max_new_tokens: Maximum tokens to generate.
-        temperature: Sampling temperature (0.7 recommended for creativity).
-
-    Returns:
-        Enhanced prompt string.
+    Enhance prompt is not available — the Gemma QAT model used for encoding
+    cannot do text generation. Returns the original prompt unchanged.
     """
-    try:
-        import torch
-        from transformers import AutoTokenizer, AutoModelForCausalLM
-    except ImportError:
-        print("    Warning: PyTorch/transformers not installed, skipping prompt enhancement")
-        return prompt
-
-    print(f"  Enhancing prompt with Gemma (via transformers)...")
-    print(f"    Original: {prompt}")
-
-    # Create enhancement chat prompt
-    enhance_chat = f"<bos><start_of_turn>user\n{ENHANCE_SYSTEM_PROMPT}\n\nPrompt to enhance: {prompt}<end_of_turn>\n<start_of_turn>model\n"
-
-    # Load model and tokenizer via transformers
-    print(f"    Loading Gemma 3 for generation...")
-    tokenizer = AutoTokenizer.from_pretrained(gemma_path)
-    model = AutoModelForCausalLM.from_pretrained(
-        gemma_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-    )
-
-    # Tokenize and generate
-    inputs = tokenizer(enhance_chat, return_tensors="pt").to(model.device)
-
-    with torch.no_grad():
-        outputs = model.generate(
-            **inputs,
-            max_new_tokens=max_new_tokens,
-            temperature=temperature,
-            do_sample=True,
-            pad_token_id=tokenizer.eos_token_id,
-        )
-
-    # Decode only the generated tokens (skip input)
-    generated_ids = outputs[0][inputs["input_ids"].shape[1]:]
-    enhanced = tokenizer.decode(generated_ids, skip_special_tokens=True)
-    enhanced = enhanced.strip()
-
-    # Clean up model from memory
-    del model
-    torch.cuda.empty_cache() if torch.cuda.is_available() else None
-    import gc
-    gc.collect()
-
-    print(f"    Enhanced: {enhanced[:100]}..." if len(enhanced) > 100 else f"    Enhanced: {enhanced}")
-
-    return enhanced if enhanced else prompt
+    print(f"  Prompt enhancement not available (Gemma QAT model cannot generate text)")
+    print(f"  Using original prompt as-is")
+    return prompt
 
 
 def encode_with_gemma(
@@ -543,26 +492,49 @@ def encode_with_av_gemma(
     max_length: int = 1024,
 ) -> tuple:
     """
-    Encode a text prompt using the AudioVideo Gemma 3 + LTX-2 text encoder pipeline.
-
-    This returns both video and audio encodings, which are processed through
-    separate embedding connectors.
-
-    Args:
-        prompt: Text prompt to encode.
-        gemma_path: Path to Gemma 3 weights directory.
-        ltx_weights_path: Path to LTX-2 AudioVideo weights (for text encoder projection).
-        max_length: Maximum token length.
+    Encode a single text prompt using the AudioVideo Gemma 3 + LTX-2 text encoder.
 
     Returns:
         Tuple of (video_encoding, audio_encoding, attention_mask) as MLX arrays.
     """
+    results = encode_av_gemma_batch(
+        prompts=[prompt],
+        gemma_path=gemma_path,
+        ltx_weights_path=ltx_weights_path,
+        max_length=max_length,
+    )
+    if results is None:
+        return None, None, None
+    return results[0]
+
+
+def encode_av_gemma_batch(
+    prompts: list,
+    gemma_path: str,
+    ltx_weights_path: str,
+    max_length: int = 1024,
+) -> list:
+    """
+    Encode multiple text prompts using one Gemma load.
+
+    Loads Gemma and the AV text encoder once, encodes all prompts sequentially,
+    then frees memory. Much more efficient than calling encode_with_av_gemma
+    multiple times (saves ~15s and ~24GB per extra prompt).
+
+    Args:
+        prompts: List of text prompts to encode.
+        gemma_path: Path to Gemma 3 weights directory.
+        ltx_weights_path: Path to LTX-2 AudioVideo weights.
+        max_length: Maximum token length (applied to first prompt, others match).
+
+    Returns:
+        List of (video_encoding, audio_encoding, attention_mask) tuples, or None on failure.
+    """
     print(f"  Loading tokenizer from {gemma_path}...")
     tokenizer = load_tokenizer(gemma_path)
     if tokenizer is None:
-        return None, None, None
+        return None
 
-    # Match PyTorch tokenizer behavior: left padding with EOS as pad token.
     tokenizer.padding_side = "left"
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
@@ -570,76 +542,101 @@ def encode_with_av_gemma(
     print(f"  Loading Gemma 3 model...")
     config = Gemma3Config()
     gemma = Gemma3Model(config)
-    # IMPORTANT: Use FP32 for Gemma - the model was trained with BF16 which has
-    # the same exponent range as FP32. Using FP16 causes numerical overflow.
     load_gemma3_weights(gemma, gemma_path, use_fp16=False)
 
     print(f"  Loading AV text encoder projection...")
     if is_v2_model(ltx_weights_path):
         print(f"  Detected LTX-2.3 (V2) model — using V2 text encoder")
-        text_encoder = create_av_text_encoder_v2()
+        text_encoder = create_av_text_encoder_v2_from_checkpoint(ltx_weights_path)
         load_av_text_encoder_v2_weights(text_encoder, ltx_weights_path)
     else:
         text_encoder = create_av_text_encoder()
         load_av_text_encoder_weights(text_encoder, ltx_weights_path)
 
-    # Tokenize prompt directly (skip chat template - it dilutes the signal)
-    print(f"  Tokenizing prompt...")
-    encoding = tokenizer(
-        prompt,
-        return_tensors="np",
-        padding="max_length",
-        truncation=True,
-        max_length=max_length,
-    )
+    results = []
+    for i, prompt in enumerate(prompts):
+        label = f"prompt {i+1}/{len(prompts)}" if len(prompts) > 1 else "prompt"
+        print(f"  Tokenizing {label}...")
+        encoding = tokenizer(
+            prompt,
+            return_tensors="np",
+            padding="max_length",
+            truncation=True,
+            max_length=max_length,
+        )
 
-    input_ids = mx.array(encoding["input_ids"])
-    attention_mask = mx.array(encoding["attention_mask"])
+        input_ids = mx.array(encoding["input_ids"])
+        attention_mask = mx.array(encoding["attention_mask"])
 
-    num_tokens = int(attention_mask.sum())
-    print(f"  Token count: {num_tokens}/{max_length}")
+        num_tokens = int(attention_mask.sum())
+        print(f"  Token count: {num_tokens}/{max_length}")
 
-    # Run through Gemma to get hidden states
-    print(f"  Running Gemma 3 forward pass (48 layers)...")
-    last_hidden, all_hidden_states = gemma(
-        input_ids,
-        attention_mask=attention_mask,
-        output_hidden_states=True,
-    )
-    mx.eval(last_hidden)
+        print(f"  Running Gemma 3 forward pass (48 layers)...")
+        last_hidden, all_hidden_states = gemma(
+            input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+        )
+        mx.eval(last_hidden)
 
-    if all_hidden_states is None:
-        print("  Error: Gemma model did not return hidden states")
-        return None, None, None
+        if all_hidden_states is None:
+            print("  Error: Gemma model did not return hidden states")
+            results.append((None, None, None))
+            continue
 
-    print(f"  Got {len(all_hidden_states)} hidden states")
+        print(f"  Got {len(all_hidden_states)} hidden states")
 
-    # Run through AV text encoder pipeline
-    print(f"  Processing through AV text encoder pipeline...")
-    av_output = text_encoder.encode_from_hidden_states(
-        hidden_states=all_hidden_states,
-        attention_mask=attention_mask,
-        padding_side="left",
-    )
-    mx.eval(av_output.video_encoding)
-    mx.eval(av_output.audio_encoding)
+        # Strip padding to real tokens only (matching ComfyUI behavior).
+        # Left-padded: real tokens are at the END. The embeddings connector
+        # appends registers to extend the sequence to 1024+, so no rounding needed.
+        real_token_count = int(attention_mask.sum())
+        seq_len = all_hidden_states[0].shape[1]
+        if real_token_count < seq_len:
+            all_hidden_states = [h[:, -real_token_count:, :] for h in all_hidden_states]
+            attention_mask = attention_mask[:, -real_token_count:]
+            print(f"  Trimmed padding: {seq_len} -> {real_token_count} (real tokens only)")
 
-    print(f"  Video encoding shape: {av_output.video_encoding.shape}")
-    print(f"  Audio encoding shape: {av_output.audio_encoding.shape}")
+        print(f"  Processing through AV text encoder pipeline...")
+        av_output = text_encoder.encode_from_hidden_states(
+            hidden_states=all_hidden_states,
+            attention_mask=attention_mask,
+            padding_side="left",
+        )
+        mx.eval(av_output.video_encoding)
+        mx.eval(av_output.audio_encoding)
 
-    # === MEMORY OPTIMIZATION ===
-    # Clear Gemma and text encoder from memory after encoding
+        print(f"  Video encoding shape: {av_output.video_encoding.shape}")
+        print(f"  Audio encoding shape: {av_output.audio_encoding.shape}")
+
+        # Diagnostic: check encoding statistics for anomalies
+        import numpy as _np
+        for name, enc in [("video", av_output.video_encoding), ("audio", av_output.audio_encoding)]:
+            arr = _np.array(enc[0])
+            real_part = arr[:real_token_count]
+            reg_part = arr[real_token_count:]
+            print(f"    {name} real[:{real_token_count}]: mean={real_part.mean():.4f} std={real_part.std():.4f} "
+                  f"min={real_part.min():.4f} max={real_part.max():.4f} nan={_np.isnan(real_part).sum()}")
+            if reg_part.shape[0] > 0:
+                print(f"    {name} regs[{real_token_count}:]: mean={reg_part.mean():.4f} std={reg_part.std():.4f} "
+                      f"min={reg_part.min():.4f} max={reg_part.max():.4f} nan={_np.isnan(reg_part).sum()}")
+
+        results.append((av_output.video_encoding, av_output.audio_encoding, av_output.attention_mask))
+
+        # Free hidden states between prompts
+        del all_hidden_states, last_hidden
+        # Update max_length to match first prompt for subsequent encodings
+        if i == 0:
+            max_length = av_output.video_encoding.shape[1]
+
+    # Free Gemma and text encoder
     print(f"  Clearing Gemma from memory...")
     del gemma
     del text_encoder
-    del all_hidden_states
-    del last_hidden
     del tokenizer
     gc.collect()
-    # Force MLX to release memory
-    mx.metal.clear_cache()
+    mx.clear_cache()
 
-    return av_output.video_encoding, av_output.audio_encoding, av_output.attention_mask
+    return results
 
 
 def create_dummy_text_encoding(
@@ -806,7 +803,7 @@ def load_transformer(
         low_memory: If True, use aggressive memory optimization.
         fast_mode: If True, skip intermediate evaluations.
     """
-    dtype_name = "FP16" if compute_dtype == mx.float16 else "FP32"
+    dtype_name = "FP16" if compute_dtype == mx.float16 else ("BF16" if compute_dtype == mx.bfloat16 else "FP32")
     fp8_str = " (FP8 dequantized)" if use_fp8 else ""
     mem_str = " (low memory)" if low_memory else ""
     fast_str = " (fast mode)" if fast_mode else ""
@@ -829,7 +826,8 @@ def load_transformer(
 
     # Load weights
     if weights_path and os.path.exists(weights_path):
-        target_dtype = "float16" if compute_dtype == mx.float16 else "float32"
+        dtype_map = {mx.float16: "float16", mx.bfloat16: "bfloat16"}
+        target_dtype = dtype_map.get(compute_dtype, "float32")
         load_transformer_weights(model, weights_path, use_fp8=use_fp8, target_dtype=target_dtype)
     else:
         print(f"  Warning: Weights not found at {weights_path}, using random init")
@@ -855,7 +853,7 @@ def load_av_transformer(
         cross_attention_adaln: V2 cross-attention AdaLN (prompt_adaln_single).
         apply_gated_attention: V2 per-head gating in attention.
     """
-    dtype_name = "FP16" if compute_dtype == mx.float16 else "FP32"
+    dtype_name = "FP16" if compute_dtype == mx.float16 else ("BF16" if compute_dtype == mx.bfloat16 else "FP32")
     fp8_str = " (FP8 dequantized)" if use_fp8 else ""
     mem_str = " (low memory)" if low_memory else ""
     v2_str = " (V2)" if cross_attention_adaln else ""
@@ -875,11 +873,13 @@ def load_av_transformer(
         low_memory=low_memory,
         cross_attention_adaln=cross_attention_adaln,
         apply_gated_attention=apply_gated_attention,
+        av_ca_timestep_scale_multiplier=1000,
     )
 
     # Load weights (including audio components)
     if weights_path and os.path.exists(weights_path):
-        target_dtype = "float16" if compute_dtype == mx.float16 else "float32"
+        dtype_map = {mx.float16: "float16", mx.bfloat16: "bfloat16"}
+        target_dtype = dtype_map.get(compute_dtype, "float32")
         load_av_transformer_weights(model, weights_path, use_fp8=use_fp8, target_dtype=target_dtype)
     else:
         print(f"  Warning: Weights not found at {weights_path}, using random init")
@@ -990,6 +990,10 @@ def generate_video(
     # IC-LoRA and Keyframe Interpolation
     keyframes: list = None,
     ic_lora_weights: str = None,
+    # Audio guidance (LTX-2.3 reference defaults)
+    audio_cfg_scale: float = None,  # None = use 7.0 default
+    rescale_scale: float = None,    # None = use 0.7 default
+    negative_prompt: str = None,    # None = use default negative prompt
 ):
     """Generate video from text prompt."""
 
@@ -1075,6 +1079,12 @@ def generate_video(
         if use_av_encoder:
             print("  WARNING: Pre-computed embeddings don't include audio encoding. Audio quality may be degraded.")
             text_audio_encoding = text_encoding  # Fallback: use video encoding for audio
+        # Still need null encoding for CFG
+        null_encoding, null_mask = create_null_text_encoding(
+            batch_size=1, max_tokens=text_encoding.shape[1], embed_dim=text_encoding.shape[2],
+        )
+        if use_av_encoder:
+            null_audio_encoding = null_encoding
     elif use_gemma:
         # Check if Gemma weights exist
         if not os.path.exists(gemma_path):
@@ -1085,17 +1095,25 @@ def generate_video(
             return
 
         if use_av_encoder:
-            # Use AudioVideo Gemma encoder (returns both video and audio encodings)
-            # V2.3 always needs this path even without audio generation
-            text_encoding, text_audio_encoding, text_mask = encode_with_av_gemma(
-                prompt=prompt,
+            # Encode both prompt AND negative prompt in one Gemma load (saves ~15s + 24GB)
+            neg_prompt = negative_prompt if negative_prompt else ""
+            results = encode_av_gemma_batch(
+                prompts=[prompt, neg_prompt],
                 gemma_path=gemma_path,
                 ltx_weights_path=weights_path,
             )
-            if text_encoding is None:
+            if results is None or results[0][0] is None:
                 print("  ERROR: Failed to encode prompt with AV encoder")
                 return
-            print(f"  Encoded with Gemma 3 (AudioVideo)")
+            text_encoding, text_audio_encoding, text_mask = results[0]
+            null_encoding, null_audio_encoding, null_mask = results[1]
+            if null_encoding is None:
+                print("  WARNING: Failed to encode negative prompt, using zeros fallback")
+                null_encoding, null_mask = create_null_text_encoding(
+                    batch_size=1, max_tokens=text_encoding.shape[1], embed_dim=text_encoding.shape[2],
+                )
+                null_audio_encoding = null_encoding
+            print(f"  Encoded both prompts with Gemma 3 (AudioVideo, single load)")
         else:
             # Use video-only Gemma encoding (V1/V2.0 only)
             text_encoding, text_mask = encode_with_gemma(
@@ -1108,56 +1126,29 @@ def generate_video(
                 print("  ERROR: Failed to encode prompt")
                 return
             print(f"  Encoded with Gemma 3")
-    else:
-        text_encoding, text_mask = create_dummy_text_encoding(prompt)
-        if generate_audio:
-            text_audio_encoding = text_encoding  # Fallback for dummy mode
-        print("  Using DUMMY encoding (test mode - output will be random)")
-
-    # Create null encoding for CFG (unconditional)
-    # For proper CFG, encode empty string through text encoder (not zeros)
-    if use_gemma and gemma_path and os.path.exists(gemma_path):
-        print("  Encoding empty prompt for CFG unconditional...")
-        if use_av_encoder:
-            # Use AudioVideo encoder for null encoding too
-            null_encoding, null_audio_encoding, null_mask = encode_with_av_gemma(
-                prompt="",  # Empty string for unconditional
-                gemma_path=gemma_path,
-                ltx_weights_path=weights_path,
-                max_length=text_encoding.shape[1],
-            )
-            if null_encoding is None:
-                print("  WARNING: Failed to encode empty prompt with AV encoder, using zeros fallback")
-                null_encoding, null_mask = create_null_text_encoding(
-                    batch_size=1,
-                    max_tokens=text_encoding.shape[1],
-                    embed_dim=text_encoding.shape[2],
-                )
-                null_audio_encoding = null_encoding  # Fallback
-        else:
+            # Null encoding for non-AV path
+            neg_prompt = negative_prompt if negative_prompt else ""
             null_encoding, null_mask = encode_with_gemma(
-                prompt="",  # Empty string for unconditional
+                prompt=neg_prompt,
                 gemma_path=gemma_path,
                 ltx_weights_path=weights_path,
                 max_length=text_encoding.shape[1],
                 use_early_layers_only=early_layers_only,
             )
             if null_encoding is None:
-                print("  WARNING: Failed to encode empty prompt, using zeros fallback")
                 null_encoding, null_mask = create_null_text_encoding(
-                    batch_size=1,
-                    max_tokens=text_encoding.shape[1],
-                    embed_dim=text_encoding.shape[2],
+                    batch_size=1, max_tokens=text_encoding.shape[1], embed_dim=text_encoding.shape[2],
                 )
     else:
-        # Fallback to zeros when Gemma is not available
+        text_encoding, text_mask = create_dummy_text_encoding(prompt)
+        if generate_audio:
+            text_audio_encoding = text_encoding
         null_encoding, null_mask = create_null_text_encoding(
-            batch_size=1,
-            max_tokens=text_encoding.shape[1],
-            embed_dim=text_encoding.shape[2],
+            batch_size=1, max_tokens=text_encoding.shape[1], embed_dim=text_encoding.shape[2],
         )
         if use_av_encoder:
-            null_audio_encoding = null_encoding  # Fallback
+            null_audio_encoding = null_encoding
+        print("  Using DUMMY encoding (test mode - output will be random)")
 
     # Load model
     # V2.3 always uses the AV transformer (dual video/audio cross-attention)
@@ -1217,6 +1208,9 @@ def generate_video(
         print(f"  WARNING: Distilled model requires CFG=1.0 (no guidance). You requested {cfg_scale}.")
         print(f"  Forcing CFG=1.0 to prevent visual artifacts.")
         cfg_scale = 1.0
+        # Distilled uses single-pass for both video AND audio (no CFG at all)
+        audio_cfg_scale = 1.0
+        rescale_scale = 0.0
         # Disable guidance rescale too since it's irrelevant without CFG
         if guidance_rescale > 0:
             guidance_rescale = 0.0
@@ -1413,8 +1407,8 @@ def generate_video(
             negative_encoding=null_encoding,
             config=config,
             images=images,
-            positive_audio_encoding=text_audio_encoding if generate_audio else None,
-            negative_audio_encoding=null_audio_encoding if generate_audio else None,
+            positive_audio_encoding=text_audio_encoding,
+            negative_audio_encoding=null_audio_encoding,
         )
 
         # Convert to frames list for save_video
@@ -1699,14 +1693,17 @@ def generate_video(
 
         # Create config with audio enabled
         # NOTE: fps=25.0 matches PyTorch's default frame_rate for audio latent calculations
+        # LTX-2.3 reference: video_cfg=3.0, audio_cfg=7.0, rescale=0.7
         av_config = OneStageCFGConfig(
             height=height,
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=25.0,  # Must match PyTorch's default frame_rate for audio parity
+            fps=24.0,  # Match LTX-2.3 reference default frame_rate
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
+            audio_cfg_scale=audio_cfg_scale if audio_cfg_scale is not None else (1.0 if model_variant == "distilled" else 7.0),
+            rescale_scale=rescale_scale if rescale_scale is not None else (0.0 if model_variant == "distilled" else 0.7),
             dtype=compute_dtype,
             audio_enabled=generate_audio,
         )
@@ -1739,7 +1736,16 @@ def generate_video(
         print()  # newline after progress
 
         # Convert to frames list for save_video
-        video_np = np.array(video)  # (T, H, W, C)
+        video_np = np.array(video)
+        print(f"  Raw video shape: {video_np.shape}, dtype: {video_np.dtype}")
+        # Squeeze any singleton dimensions
+        video_np = np.squeeze(video_np)
+        # Handle (C, T, H, W) format — C=3 is always smallest dim
+        if video_np.ndim == 4 and video_np.shape[0] == 3:
+            video_np = np.transpose(video_np, (1, 2, 3, 0))  # (T, H, W, C)
+        # Convert float32 [-1,1] to uint8 [0,255] (VAE output range is [-1, 1])
+        if video_np.dtype != np.uint8:
+            video_np = np.clip((video_np + 1) / 2 * 255.0, 0, 255).astype(np.uint8)
         frames = [video_np[t] for t in range(video_np.shape[0])]
         print(f"  Generated {len(frames)} frames at {frames[0].shape[:2]}")
 
@@ -2239,6 +2245,8 @@ def save_video_with_audio(
         speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
         audio_sample_rate: Audio sample rate in Hz.
     """
+    import os
+    import shutil
     import subprocess
     import tempfile
     import wave
@@ -2279,6 +2287,11 @@ def save_video_with_audio(
             wav_file.setsampwidth(2)  # 16-bit
             wav_file.setframerate(audio_sample_rate)
             wav_file.writeframes(audio_flat.tobytes())
+
+        # Save a sidecar WAV beside the MP4 so export compression can be compared directly.
+        sidecar_wav_path = os.path.splitext(output_path)[0] + ".wav"
+        shutil.copy2(audio_path, sidecar_wav_path)
+        print(f"    Sidecar WAV: {sidecar_wav_path}")
 
         print(f"    Audio: {len(audio_flat) // 2} samples, {len(audio_flat) // 2 / audio_sample_rate:.2f}s")
 
@@ -2332,6 +2345,8 @@ def save_video_with_audio(
         cmd.extend([
             "-c:v", "libx264",
             "-c:a", "aac",
+            "-b:a", "320k",
+            "-ar", str(audio_sample_rate),
             "-pix_fmt", "yuv420p",
             "-crf", "18",
             "-shortest",  # Use shortest duration (video or audio)

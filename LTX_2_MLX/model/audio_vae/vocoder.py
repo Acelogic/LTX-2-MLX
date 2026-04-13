@@ -208,7 +208,8 @@ def kaiser_sinc_filter1d(
         filter_ = np.zeros_like(time)
     else:
         x = 2 * cutoff * time
-        sinc = np.where(x == 0, 1.0, np.sin(np.pi * x) / (np.pi * x))
+        safe_denom = np.where(x == 0, 1.0, np.pi * x)
+        sinc = np.where(x == 0, 1.0, np.sin(np.pi * x) / safe_denom)
         filter_ = 2 * cutoff * window * sinc
         filter_ /= filter_.sum()
 
@@ -329,11 +330,13 @@ class UpSample1d(nn.Module):
                 time_axis_rolloff, -lowpass_filter_width, lowpass_filter_width
             )
             window = np.cos(time_clamped * math.pi / lowpass_filter_width / 2) ** 2
+            # Use safe division to avoid RuntimeWarning: invalid value in divide
+            # (np.where evaluates both branches before masking)
+            safe_denom = np.where(time_axis_rolloff == 0, 1.0, np.pi * time_axis_rolloff)
             sinc_vals = np.where(
                 time_axis_rolloff == 0,
                 1.0,
-                np.sin(np.pi * time_axis_rolloff)
-                / (np.pi * time_axis_rolloff),
+                np.sin(np.pi * time_axis_rolloff) / safe_denom,
             )
             sinc_filter = (sinc_vals * window * rolloff / ratio).reshape(1, 1, -1)
         else:
@@ -450,6 +453,7 @@ class AMPBlock1(nn.Module):
             xt = a2(xt)
             xt = c2(xt)
             x = x + xt
+            mx.eval(x)  # Prevent GPU watchdog timeout on long audio
         return x
 
 
@@ -499,6 +503,7 @@ class _STFTFn(nn.Module):
         # forward_basis is (n_freqs*2, 1, filter_length) in PyTorch = (out, in, k)
         # MLX needs (out, k, in) = (n_freqs*2, filter_length, 1)
         spec = mx.conv1d(y_mlx, w, stride=self.hop_length)
+        mx.eval(spec)
         spec = spec.transpose(0, 2, 1)  # (B, n_freqs*2, T_frames)
 
         n_freqs = spec.shape[1] // 2
@@ -591,12 +596,26 @@ class VocoderWithBWE(nn.Module):
     def __call__(self, mel_spec: mx.array) -> mx.array:
         """Run vocoder + BWE forward pass.
 
+        Runs in float32 regardless of input dtype.  bfloat16 accumulation
+        errors compound through 108 sequential convolutions in the BigVGAN v2
+        architecture and degrade spectral metrics by 40-90%.  fp32 eliminates
+        this degradation.  (Matches upstream PyTorch autocast strategy.)
+
         Args:
             mel_spec: (B, 2, T, mel_bins) stereo mel spectrogram.
         Returns:
             Waveform (B, out_channels, T_out) clipped to [-1, 1].
         """
+        input_dtype = mel_spec.dtype
+        # Force fp32 for the entire vocoder + BWE chain.
+        # bfloat16 accumulation errors degrade spectral metrics by 40-90%.
+        mel_spec = mel_spec.astype(mx.float32)
+
+        # Stage 1: Main vocoder (108 convolutions)
         x = self.vocoder(mel_spec)
+        mx.eval(x)
+        mx.clear_cache()
+
         _, _, length_low_rate = x.shape
         output_length = (
             length_low_rate
@@ -610,15 +629,27 @@ class VocoderWithBWE(nn.Module):
             pad_amount = self.hop_length - remainder
             x = mx.pad(x, [(0, 0), (0, 0), (0, pad_amount)])
 
-        # Compute mel from vocoder output
+        # Stage 2: Compute mel from vocoder output for BWE
         mel = self._compute_mel(x)  # (B, C, n_mels, T_frames)
+        mx.eval(mel)
+        mx.clear_cache()
 
-        # Vocoder.forward expects (B, C, T, mel_bins) — transpose
+        # Stage 3: BWE generator (another 108 convolutions) + resampler
         mel_for_bwe = mel.transpose(0, 1, 3, 2)  # (B, C, T_frames, mel_bins)
+        del mel  # Free mel before BWE
         residual = self.bwe_generator(mel_for_bwe)
-        skip = self.resampler(x)
+        mx.eval(residual)
+        del mel_for_bwe
+        mx.clear_cache()
 
-        return mx.clip(residual + skip, -1, 1)[:, :, :output_length]
+        skip = self.resampler(x)
+        mx.eval(skip)
+        del x  # Free base waveform
+        mx.clear_cache()
+
+        result = mx.clip(residual + skip, -1, 1)[:, :, :output_length]
+        mx.eval(result)
+        return result.astype(input_dtype)
 
 
 class Vocoder(nn.Module):
@@ -724,9 +755,9 @@ class Vocoder(nn.Module):
         Returns:
             Audio waveform (B, 2, audio_length)
         """
-        # Cast to compute dtype
-        if self.compute_dtype != mx.float32:
-            x = x.astype(self.compute_dtype)
+        # Always run in fp32 — bfloat16 accumulation errors compound through
+        # 108 sequential convolutions causing 40-90% spectral degradation
+        x = x.astype(mx.float32)
 
         # Transpose: (B, channels, time, mel_bins) -> (B, channels, mel_bins, time)
         x = x.transpose(0, 1, 3, 2)
@@ -757,6 +788,7 @@ class Vocoder(nn.Module):
             x = mx.stack(block_outputs, axis=0).mean(axis=0)
 
             mx.eval(x)
+            mx.clear_cache()  # Free intermediate buffers between vocoder stages
 
         # Post-activation
         if self.is_amp and self.act_post is not None:
@@ -766,16 +798,13 @@ class Vocoder(nn.Module):
             x = nn.leaky_relu(x)
 
         x = self.conv_post(x)
+        mx.eval(x)
 
         if self.apply_final_activation:
             if self.use_tanh_at_final:
                 x = mx.tanh(x)
             else:
                 x = mx.clip(x, -1, 1)
-
-        # Cast back to float32
-        if self.compute_dtype != mx.float32:
-            x = x.astype(mx.float32)
 
         return x
 

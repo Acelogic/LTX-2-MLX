@@ -28,10 +28,17 @@ from ..components import (
     STAGE_2_DISTILLED_SIGMA_VALUES,
     VideoLatentPatchifier,
 )
+from ..components.guiders import MultiModalGuider, MultiModalGuiderParams
+from ..components.perturbations import (
+    BatchedPerturbationConfig,
+    Perturbation,
+    PerturbationConfig,
+    PerturbationType,
+)
 from ..components.patchifiers import AudioPatchifier
 from ..conditioning.tools import VideoLatentTools, AudioLatentTools
 from ..loader import LoRAConfig, fuse_lora_into_weights
-from ..model.transformer import LTXModel, Modality, X0Model
+from ..model.transformer import LTXModel, LTXAVModel, LTXModelType, Modality, X0Model
 from ..model.video_vae.simple_decoder import SimpleVideoDecoder, decode_latent
 from ..model.video_vae.simple_encoder import SimpleVideoEncoder
 from ..model.video_vae.tiling import TilingConfig, decode_tiled
@@ -92,12 +99,17 @@ class TwoStageCFGConfig:
     fps: float = 25.0  # Match PyTorch default frame_rate for audio latent calculations
     num_inference_steps: int = 30
 
-    # CFG parameters (for stage 1)
+    # Guidance parameters (for stage 1) — matching Reddit/ComfyUI working config
     cfg_scale: float = 3.0
-    guidance_rescale: float = 0.7  # Rescale CFG to prevent variance explosion (0=off, 0.7=default)
+    audio_cfg_scale: float = 7.0
+    guidance_rescale: float = 0.0  # 0=off (Reddit working config), 0.7=paper default
+    modality_scale: float = 3.0   # Cross-modal guidance (Reddit: 3.0 for both, critical for audio)
 
     # LoRA config for stage 2 (distilled refinement)
     distilled_lora_config: Optional[LoRAConfig] = None
+
+    # Custom stage 2 sigmas (None = use default STAGE_2_DISTILLED_SIGMA_VALUES)
+    stage_2_sigmas: Optional[list] = None
 
     # Tiling for VAE decoding
     tiling_config: Optional[TilingConfig] = None
@@ -107,6 +119,7 @@ class TwoStageCFGConfig:
 
     # Audio configuration
     audio_enabled: bool = False
+    use_internal_audio_branch: bool = True
     audio_vae_channels: int = 8
     audio_mel_bins: int = 16
     audio_sample_rate: int = 16000
@@ -170,6 +183,8 @@ class TwoStagePipeline:
             self._velocity_model = transformer
             # Wrap in X0Model for denoising (velocity -> denoised conversion)
             self.transformer = X0Model(transformer)
+        inner = self._velocity_model if hasattr(self, "_velocity_model") else transformer
+        self.is_av_model = getattr(inner, "model_type", None) == LTXModelType.AudioVideo
         self.video_encoder = video_encoder
         self.video_decoder = video_decoder
         self.spatial_upscaler = spatial_upscaler
@@ -222,6 +237,14 @@ class TwoStagePipeline:
         mel_spectrogram = self.audio_decoder(audio_latent)
         mx.eval(mel_spectrogram)
 
+        # Diagnostic: save mel spectrogram for comparison with ComfyUI
+        import numpy as _np
+        _mel_np = _np.array(mel_spectrogram)
+        _np.save("/tmp/mlx_mel_spectrogram.npy", _mel_np)
+        print(f"  [diag] Saved mel spectrogram: shape={_mel_np.shape}, "
+              f"mean={_mel_np.mean():.4f}, std={_mel_np.std():.4f}, "
+              f"min={_mel_np.min():.4f}, max={_mel_np.max():.4f}")
+
         # Convert mel spectrogram to waveform
         waveform = self.vocoder(mel_spectrogram)
         mx.eval(waveform)
@@ -234,7 +257,8 @@ class TwoStagePipeline:
         sigmas: mx.array,
         positive_context: mx.array,
         negative_context: mx.array,
-        guider: CFGGuider,
+        video_guider: CFGGuider,
+        audio_guider: CFGGuider,
         stepper: EulerDiffusionStep,
         guidance_rescale: float = 0.0,
         callback: Optional[Callable[[str, int, int], None]] = None,
@@ -296,72 +320,52 @@ class TwoStagePipeline:
         negative_video_context: mx.array,
         positive_audio_context: mx.array,
         negative_audio_context: mx.array,
-        guider: CFGGuider,
+        video_guider: MultiModalGuider,
+        audio_guider: MultiModalGuider,
         stepper: EulerDiffusionStep,
-        guidance_rescale: float = 0.0,
         callback: Optional[Callable[[str, int, int], None]] = None,
     ) -> Tuple[LatentState, LatentState]:
         """
-        Run joint audio-video denoising loop with CFG guidance (Stage 1).
+        Run joint audio-video denoising with multi-modal guidance (Stage 1).
 
-        Args:
-            video_state: Initial noisy video latent state.
-            audio_state: Initial noisy audio latent state.
-            sigmas: Sigma schedule.
-            positive_video_context: Positive text context for video.
-            negative_video_context: Negative text context for video.
-            positive_audio_context: Positive text context for audio.
-            negative_audio_context: Negative text context for audio.
-            guider: CFG guider instance.
-            stepper: Diffusion stepper.
-            guidance_rescale: Rescale factor to prevent variance explosion.
-            callback: Optional callback(stage, step, total_steps).
+        Passes per step (matching Reddit/ComfyUI working config):
+          1. cond: conditioned (positive context)
+          2. uncond: unconditioned (negative context) — for CFG
+          3. mod: modality-isolated (cross-attn A<>V skipped) — for modality CFG
 
-        Returns:
-            Tuple of (denoised_video_state, denoised_audio_state).
+        STG and rescale disabled (stg=0, rescale=0) per Reddit working config.
         """
         num_steps = len(sigmas) - 1
 
         for step_idx in range(num_steps):
             sigma = float(sigmas[step_idx])
 
-            # Create positive (conditioned) modalities
-            pos_video_modality = modality_from_state(
-                video_state, positive_video_context, sigma
-            )
-            pos_audio_modality = audio_modality_from_state(
-                audio_state, positive_audio_context, sigma
-            )
+            # --- Pass 1: Conditioned ---
+            pos_video_mod = modality_from_state(video_state, positive_video_context, sigma)
+            pos_audio_mod = audio_modality_from_state(audio_state, positive_audio_context, sigma)
+            cond_v, cond_a = self.transformer(pos_video_mod, pos_audio_mod)
 
-            # Run joint forward pass (conditioned)
-            pos_video_denoised, pos_audio_denoised = self.transformer(
-                pos_video_modality, pos_audio_modality
-            )
+            # --- Pass 2: Unconditioned (CFG) ---
+            uncond_v, uncond_a = 0.0, 0.0
+            if video_guider.do_unconditional_generation() or audio_guider.do_unconditional_generation():
+                neg_video_mod = modality_from_state(video_state, negative_video_context, sigma)
+                neg_audio_mod = audio_modality_from_state(audio_state, negative_audio_context, sigma)
+                uncond_v, uncond_a = self.transformer(neg_video_mod, neg_audio_mod)
+                mx.eval(uncond_v, uncond_a)
 
-            # Run negative (unconditioned) prediction for CFG
-            if guider.enabled():
-                neg_video_modality = modality_from_state(
-                    video_state, negative_video_context, sigma
-                )
-                neg_audio_modality = audio_modality_from_state(
-                    audio_state, negative_audio_context, sigma
-                )
+            # --- Pass 3: Modality-isolated (cross-modal attn skipped) ---
+            mod_v, mod_a = 0.0, 0.0
+            if video_guider.do_isolated_modality_generation() or audio_guider.do_isolated_modality_generation():
+                mod_ptb = BatchedPerturbationConfig([PerturbationConfig([
+                    Perturbation(type=PerturbationType.SKIP_A2V_CROSS_ATTN, blocks=None),
+                    Perturbation(type=PerturbationType.SKIP_V2A_CROSS_ATTN, blocks=None),
+                ])])
+                mod_v, mod_a = self.transformer(pos_video_mod, pos_audio_mod, perturbations=mod_ptb)
+                mx.eval(mod_v, mod_a)
 
-                neg_video_denoised, neg_audio_denoised = self.transformer(
-                    neg_video_modality, neg_audio_modality
-                )
-
-                # Apply CFG guidance to both modalities
-                video_denoised = guider.guide(pos_video_denoised, neg_video_denoised)
-                audio_denoised = guider.guide(pos_audio_denoised, neg_audio_denoised)
-
-                # Apply guidance rescale to prevent variance explosion
-                if guidance_rescale > 0:
-                    video_denoised = rescale_noise_cfg(video_denoised, pos_video_denoised, guidance_rescale)
-                    audio_denoised = rescale_noise_cfg(audio_denoised, pos_audio_denoised, guidance_rescale)
-            else:
-                video_denoised = pos_video_denoised
-                audio_denoised = pos_audio_denoised
+            # --- Combine via MultiModalGuider ---
+            video_denoised = video_guider.calculate(cond_v, uncond_v, 0.0, mod_v)
+            audio_denoised = audio_guider.calculate(cond_a, uncond_a, 0.0, mod_a)
 
             # Post-process with denoise mask
             video_denoised = post_process_latent(
@@ -520,13 +524,16 @@ class TwoStagePipeline:
         """
         images = images or []
 
-        # Validate audio parameters
-        if config.audio_enabled:
+        internal_audio_active = self.is_av_model and (config.use_internal_audio_branch or config.audio_enabled)
+
+        # AV checkpoints can use audio context internally even for silent video output.
+        if config.audio_enabled or internal_audio_active:
             if positive_audio_encoding is None or negative_audio_encoding is None:
                 raise ValueError(
-                    "Audio encoding required when audio_enabled is True. "
+                    "Audio encoding required for AudioVideo generation. "
                     "Provide positive_audio_encoding and negative_audio_encoding."
                 )
+        if config.audio_enabled:
             if self.audio_decoder is None or self.vocoder is None:
                 raise ValueError(
                     "Audio decoder and vocoder required when audio_enabled is True."
@@ -538,7 +545,20 @@ class TwoStagePipeline:
         # Create components
         noiser = GaussianNoiser()
         stepper = self.diffusion_step
-        guider = CFGGuider(scale=config.cfg_scale)
+        # MultiModalGuider matching Reddit/ComfyUI working config:
+        # CFG active, STG=0, modality_scale=3, rescale=0
+        video_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=config.cfg_scale,
+                modality_scale=config.modality_scale,
+            ),
+        )
+        audio_guider = MultiModalGuider(
+            params=MultiModalGuiderParams(
+                cfg_scale=config.audio_cfg_scale,
+                modality_scale=config.modality_scale,
+            ),
+        )
 
         # ====== STAGE 1: Half resolution with CFG ======
         stage_1_height = config.height // 2
@@ -580,10 +600,10 @@ class TwoStagePipeline:
         # Add noise to video
         video_state = noiser(video_state, noise_scale=1.0)
 
-        # Handle audio if enabled
+        # Keep an internal audio state for AV checkpoints when requested.
         audio_state = None
         audio_tools = None
-        if config.audio_enabled:
+        if internal_audio_active:
             # Create audio latent shape from video duration
             audio_shape = AudioLatentShape.from_video_pixel_shape(
                 stage_1_pixel_shape,
@@ -598,7 +618,7 @@ class TwoStagePipeline:
             audio_state = noiser(audio_state, noise_scale=1.0)
 
         # Run stage 1 denoising
-        if config.audio_enabled and audio_state is not None:
+        if internal_audio_active and audio_state is not None:
             # Joint audio-video denoising with CFG
             video_state, audio_state = self._denoise_loop_cfg_av(
                 video_state=video_state,
@@ -608,9 +628,9 @@ class TwoStagePipeline:
                 negative_video_context=negative_encoding,
                 positive_audio_context=positive_audio_encoding,
                 negative_audio_context=negative_audio_encoding,
-                guider=guider,
+                video_guider=video_guider,
+                audio_guider=audio_guider,
                 stepper=stepper,
-                guidance_rescale=config.guidance_rescale,
                 callback=callback,
             )
         else:
@@ -620,7 +640,7 @@ class TwoStagePipeline:
                 sigmas=sigmas,
                 positive_context=positive_encoding,
                 negative_context=negative_encoding,
-                guider=guider,
+                guider=video_guider,
                 stepper=stepper,
                 guidance_rescale=config.guidance_rescale,
                 callback=callback,
@@ -632,7 +652,7 @@ class TwoStagePipeline:
 
         stage_1_video_latent = video_state.latent
         stage_1_audio_latent = None
-        if config.audio_enabled and audio_state is not None and audio_tools is not None:
+        if internal_audio_active and audio_state is not None and audio_tools is not None:
             audio_state = audio_tools.clear_conditioning(audio_state)
             audio_state = audio_tools.unpatchify(audio_state)
             stage_1_audio_latent = audio_state.latent
@@ -704,8 +724,9 @@ class TwoStagePipeline:
             video_state_2, stage_2_conditionings, video_tools_2
         )
 
-        # Get stage 2 distilled sigmas
-        distilled_sigmas = mx.array(STAGE_2_DISTILLED_SIGMA_VALUES)
+        # Get stage 2 distilled sigmas (use custom if provided)
+        stage_2_values = config.stage_2_sigmas if config.stage_2_sigmas is not None else STAGE_2_DISTILLED_SIGMA_VALUES
+        distilled_sigmas = mx.array(stage_2_values)
 
         # Add noise at lower scale for refinement
         video_state_2 = noiser(video_state_2, noise_scale=float(distilled_sigmas[0]))
@@ -713,7 +734,7 @@ class TwoStagePipeline:
         # Handle audio for stage 2
         audio_state_2 = None
         audio_tools_2 = None
-        if config.audio_enabled and stage_1_audio_latent is not None:
+        if internal_audio_active:
             # Create audio tools for stage 2 (same shape as stage 1 - no spatial upscaling for audio)
             audio_shape_2 = AudioLatentShape.from_video_pixel_shape(
                 stage_2_pixel_shape,
@@ -724,13 +745,16 @@ class TwoStagePipeline:
                 audio_latent_downsample_factor=config.audio_downsample_factor,
             )
             audio_tools_2 = self._create_audio_tools(audio_shape_2)
-            audio_state_2 = audio_tools_2.create_initial_state(
-                dtype=config.dtype, initial_latent=stage_1_audio_latent
-            )
+            if stage_1_audio_latent is not None:
+                audio_state_2 = audio_tools_2.create_initial_state(
+                    dtype=config.dtype, initial_latent=stage_1_audio_latent
+                )
+            else:
+                audio_state_2 = audio_tools_2.create_initial_state(dtype=config.dtype)
             audio_state_2 = noiser(audio_state_2, noise_scale=float(distilled_sigmas[0]))
 
         # Run stage 2 denoising (simple, no CFG)
-        if config.audio_enabled and audio_state_2 is not None:
+        if internal_audio_active and audio_state_2 is not None:
             # Joint audio-video refinement
             video_state_2, audio_state_2 = self._denoise_loop_simple_av(
                 video_state=video_state_2,

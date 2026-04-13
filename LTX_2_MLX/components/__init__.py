@@ -14,10 +14,13 @@ from .guiders import (
     STGGuider,
     LtxAPGGuider,
     LegacyStatefulAPGGuider,
+    MultiModalGuider,
+    MultiModalGuiderParams,
     projection_coef,
 )
 from .noisers import GaussianNoiser, DeterministicNoiser
-from .diffusion_steps import EulerDiffusionStep, HeunDiffusionStep
+from .diffusion_steps import EulerDiffusionStep, EulerAncestralDiffusionStep, HeunDiffusionStep, Res2sDiffusionStep
+from .res2s import phi, get_res2s_coefficients
 from .patchifiers import (
     VideoLatentPatchifier,
     AudioPatchifier,
@@ -53,6 +56,9 @@ __all__ = [
     # Diffusion steps
     "EulerDiffusionStep",
     "HeunDiffusionStep",
+    "Res2sDiffusionStep",
+    "phi",
+    "get_res2s_coefficients",
     # Patchifiers
     "VideoLatentPatchifier",
     "AudioPatchifier",

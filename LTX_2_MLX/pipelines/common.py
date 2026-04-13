@@ -66,9 +66,30 @@ def load_image_tensor(
             f"Supported formats: RGB, RGBA, L"
         )
 
-    # Convert to RGB and resize
+    # Convert to RGB, then aspect-ratio-preserving resize + center crop
     img = img.convert("RGB")
-    img = img.resize((width, height), Image.Resampling.LANCZOS)
+    src_w, src_h = img.size
+    target_aspect = width / height
+    src_aspect = src_w / src_h
+
+    if abs(src_aspect - target_aspect) < 0.01:
+        # Aspect ratios match — direct resize
+        img = img.resize((width, height), Image.Resampling.LANCZOS)
+    else:
+        # Scale so the image covers the target area, then center crop
+        if src_aspect > target_aspect:
+            # Source is wider — fit by height, crop width
+            new_h = height
+            new_w = int(src_w * (height / src_h))
+        else:
+            # Source is taller — fit by width, crop height
+            new_w = width
+            new_h = int(src_h * (width / src_w))
+        img = img.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        # Center crop to exact target
+        left = (new_w - width) // 2
+        top = (new_h - height) // 2
+        img = img.crop((left, top, left + width, top + height))
 
     # Convert to numpy and normalize to [-1, 1]
     img_np = np.array(img).astype(np.float32) / 127.5 - 1.0

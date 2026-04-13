@@ -1,6 +1,7 @@
 """Video Gemma Text Encoder for LTX-2."""
 
 from dataclasses import dataclass
+import json
 from typing import List, Optional
 
 import mlx.core as mx
@@ -8,6 +9,7 @@ import mlx.nn as nn
 
 from .connector import Embeddings1DConnector
 from .feature_extractor import GemmaFeaturesExtractorProjLinear, GemmaFeaturesExtractorV2
+from ..transformer.rope import LTXRopeType
 
 
 @dataclass
@@ -712,6 +714,43 @@ def load_av_text_encoder_weights(
     print(f"  Loaded {loaded_count} AV text encoder weight tensors")
 
 
+def _read_transformer_config_from_checkpoint(weights_path: str) -> dict:
+    """Read transformer config from checkpoint metadata."""
+    from safetensors import safe_open
+
+    try:
+        with safe_open(weights_path, framework="pt") as f:
+            metadata = f.metadata() or {}
+        config = json.loads(metadata.get("config", "{}"))
+    except Exception:
+        return {}
+
+    transformer_config = config.get("transformer", {})
+    return transformer_config if isinstance(transformer_config, dict) else {}
+
+
+def _parse_rope_type(value) -> LTXRopeType:
+    """Parse a checkpoint rope type value safely."""
+    if isinstance(value, LTXRopeType):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in ("split", "interleaved"):
+            return LTXRopeType(normalized)
+    return LTXRopeType.INTERLEAVED
+
+
+def _normalize_positional_embedding_max_pos(value) -> list[int]:
+    """Normalize checkpoint positional max positions to a non-empty int list."""
+    if value is None:
+        return [1]
+    if isinstance(value, (int, float)):
+        return [int(value)]
+    if isinstance(value, (list, tuple)) and value:
+        return [int(v) for v in value]
+    return [1]
+
+
 def create_av_text_encoder_v2(
     hidden_dim: int = 3840,
     num_gemma_layers: int = 49,
@@ -723,6 +762,10 @@ def create_av_text_encoder_v2(
     audio_connector_head_dim: int = 64,
     connector_layers: int = 8,
     num_registers: int = 128,
+    positional_embedding_max_pos: Optional[List[int]] = None,
+    rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    connector_apply_gated_attention: bool = True,
+    double_precision_rope: bool = False,
 ) -> AudioVideoGemmaTextEncoderModel:
     """Create a V2 audio+video text encoder for LTX-2.3.
 
@@ -741,7 +784,10 @@ def create_av_text_encoder_v2(
         num_attention_heads=video_connector_heads,
         num_layers=connector_layers,
         num_learnable_registers=num_registers,
-        apply_gated_attention=True,
+        positional_embedding_max_pos=positional_embedding_max_pos,
+        rope_type=rope_type,
+        apply_gated_attention=connector_apply_gated_attention,
+        double_precision_rope=double_precision_rope,
     )
 
     audio_embeddings_connector = Embeddings1DConnector(
@@ -749,13 +795,79 @@ def create_av_text_encoder_v2(
         num_attention_heads=audio_connector_heads,
         num_layers=connector_layers,
         num_learnable_registers=num_registers,
-        apply_gated_attention=True,
+        positional_embedding_max_pos=positional_embedding_max_pos,
+        rope_type=rope_type,
+        apply_gated_attention=connector_apply_gated_attention,
+        double_precision_rope=double_precision_rope,
     )
 
     return AudioVideoGemmaTextEncoderModel(
         feature_extractor=feature_extractor,
         embeddings_connector=embeddings_connector,
         audio_embeddings_connector=audio_embeddings_connector,
+    )
+
+
+def create_av_text_encoder_v2_from_checkpoint(
+    weights_path: str,
+    hidden_dim: int = 3840,
+    num_gemma_layers: int = 49,
+    video_inner_dim: int = 4096,
+    audio_inner_dim: int = 2048,
+    num_registers: int = 128,
+) -> AudioVideoGemmaTextEncoderModel:
+    """Create a V2 AV text encoder using connector settings from checkpoint metadata."""
+    transformer_config = _read_transformer_config_from_checkpoint(weights_path)
+
+    video_connector_heads = int(transformer_config.get("connector_num_attention_heads", 32))
+    video_connector_head_dim = int(transformer_config.get("connector_attention_head_dim", 128))
+    connector_layers = int(transformer_config.get("connector_num_layers", 8))
+
+    audio_connector_heads = int(
+        transformer_config.get("audio_connector_num_attention_heads", video_connector_heads)
+    )
+    audio_connector_head_dim = int(
+        transformer_config.get("audio_connector_attention_head_dim", 64)
+    )
+    positional_embedding_max_pos = _normalize_positional_embedding_max_pos(
+        transformer_config.get("connector_positional_embedding_max_pos")
+    )
+    rope_type = _parse_rope_type(
+        transformer_config.get("rope_type", transformer_config.get("split_rope"))
+    )
+    connector_apply_gated_attention = bool(
+        transformer_config.get("connector_apply_gated_attention", True)
+    )
+    # V2.3 checkpoints specify frequencies_precision: float64
+    double_precision_rope = (
+        transformer_config.get("frequencies_precision", "") == "float64"
+    )
+
+    print(
+        "  AV text encoder config: "
+        f"video_heads={video_connector_heads}x{video_connector_head_dim}, "
+        f"audio_heads={audio_connector_heads}x{audio_connector_head_dim}, "
+        f"layers={connector_layers}, rope={rope_type.value}, "
+        f"max_pos={positional_embedding_max_pos}, "
+        f"gated={'on' if connector_apply_gated_attention else 'off'}, "
+        f"double_precision_rope={'on' if double_precision_rope else 'off'}"
+    )
+
+    return create_av_text_encoder_v2(
+        hidden_dim=hidden_dim,
+        num_gemma_layers=num_gemma_layers,
+        video_inner_dim=video_inner_dim,
+        audio_inner_dim=audio_inner_dim,
+        video_connector_heads=video_connector_heads,
+        video_connector_head_dim=video_connector_head_dim,
+        audio_connector_heads=audio_connector_heads,
+        audio_connector_head_dim=audio_connector_head_dim,
+        connector_layers=connector_layers,
+        num_registers=num_registers,
+        positional_embedding_max_pos=positional_embedding_max_pos,
+        rope_type=rope_type,
+        connector_apply_gated_attention=connector_apply_gated_attention,
+        double_precision_rope=double_precision_rope,
     )
 
 

@@ -94,6 +94,7 @@ class TransformerArgsPreprocessor:
         rope_type: LTXRopeType = LTXRopeType.SPLIT,  # LTX-2 distilled uses SPLIT
         compute_dtype: mx.Dtype = mx.float32,
         prompt_adaln: Optional[AdaLayerNormSingle] = None,
+        use_double_precision: bool = False,
     ):
         self.patchify_proj = patchify_proj
         self.adaln = adaln
@@ -107,6 +108,7 @@ class TransformerArgsPreprocessor:
         self.rope_type = rope_type
         self.compute_dtype = compute_dtype
         self.prompt_adaln = prompt_adaln
+        self.use_double_precision = use_double_precision
 
     def _prepare_timestep(
         self,
@@ -363,12 +365,19 @@ class MultiModalTransformerArgsPreprocessor:
 
         return scale_shift_emb, gate_emb
 
-    def prepare(self, modality: Modality) -> TransformerArgs:
+    def prepare(
+        self,
+        modality: Modality,
+        cross_modality: Optional[Modality] = None,
+    ) -> TransformerArgs:
         """
         Prepare all inputs for AudioVideo transformer blocks.
 
         Args:
             modality: Input modality data (video or audio).
+            cross_modality: The OTHER modality, used to compute cross-attention
+                timestep embeddings. When preparing audio, pass video here
+                (and vice versa). Matches PyTorch: prepare(audio, video).
 
         Returns:
             TransformerArgs with cross-modal attention fields populated.
@@ -376,13 +385,22 @@ class MultiModalTransformerArgsPreprocessor:
         # Get basic transformer args
         args = self.simple_preprocessor.prepare(modality)
 
-        # Add cross-modal positional embeddings
+        if cross_modality is None:
+            return args
+
+        # Cross-modal positional embeddings use THIS modality's temporal positions
         cross_pe = self._prepare_cross_positional_embeddings(modality.positions)
 
-        # Add cross-attention timestep embeddings
+        # Cross-attention timestep uses the OTHER modality's sigma
+        # This is critical: audio cross-attn timestep comes from video's sigma,
+        # and video cross-attn timestep comes from audio's sigma
+        cross_sigma = cross_modality.sigma if cross_modality.sigma is not None else cross_modality.timesteps
+        if cross_sigma.ndim > 1:
+            cross_sigma = cross_sigma[:, 0]  # Per-token: use first token's sigma
+
         batch_size = args.x.shape[0]
         cross_scale_shift, cross_gate = self._prepare_cross_attention_timestep(
-            modality.timesteps, batch_size
+            cross_sigma, batch_size
         )
 
         return args.replace(
@@ -608,7 +626,7 @@ class LTXModel(nn.Module):
                 dim=self.audio_inner_dim,
                 heads=self.AUDIO_ATTENTION_HEADS,
                 d_head=self.AUDIO_HEAD_DIM,
-                context_dim=cross_attention_dim,
+                context_dim=self.audio_inner_dim,  # 2048, not 4096 — matches PyTorch audio_cross_attention_dim
                 cross_attention_adaln=cross_attention_adaln,
                 apply_gated_attention=apply_gated_attention,
             )
@@ -681,6 +699,10 @@ class LTXModel(nn.Module):
             else:
                 self._audio_args_preprocessor = audio_simple_preprocessor
 
+    # Audio layer debug: set to a directory path to capture per-layer audio states
+    _audio_layer_debug_dir: Optional[str] = None
+    _audio_layer_debug_done: bool = False
+
     def _process_transformer_blocks(
         self,
         video_args: Optional[TransformerArgs] = None,
@@ -688,6 +710,13 @@ class LTXModel(nn.Module):
         perturbations: Optional[BatchedPerturbationConfig] = None,
     ) -> Tuple[Optional[TransformerArgs], Optional[TransformerArgs]]:
         """Process transformer blocks."""
+        capture = (
+            self._audio_layer_debug_dir is not None
+            and not self._audio_layer_debug_done
+            and audio_args is not None
+            and audio_args.enabled
+        )
+
         for i, block in enumerate(self.transformer_blocks):
             video_args, audio_args = block(video_args, audio_args, perturbations=perturbations)
 
@@ -697,6 +726,19 @@ class LTXModel(nn.Module):
                     mx.eval(video_args.x)
                 if audio_args is not None:
                     mx.eval(audio_args.x)
+
+            # Capture audio state after each block (first denoising step only)
+            if capture and audio_args is not None:
+                import numpy as _np
+                mx.eval(audio_args.x)
+                path = f"{self._audio_layer_debug_dir}/audio_layer_{i:04d}.npy"
+                _np.save(path, _np.array(audio_args.x.astype(mx.float32)))
+                if i == 0:
+                    print(f"  [debug] Capturing audio layer states...")
+                if i == len(self.transformer_blocks) - 1:
+                    print(f"  [debug] Saved {i+1} layer states to {self._audio_layer_debug_dir}")
+                    self._audio_layer_debug_done = True
+
         return video_args, audio_args
 
     def _process_video_output(
@@ -780,7 +822,7 @@ class LTXModel(nn.Module):
         if self.model_type.is_video_enabled():
             if video is None:
                 raise ValueError("Video modality required for video-enabled model")
-            video_args = self._video_args_preprocessor.prepare(video)
+            video_args = self._video_args_preprocessor.prepare(video, audio)
 
         audio_args = None
         if self.model_type.is_audio_enabled():
@@ -797,7 +839,7 @@ class LTXModel(nn.Module):
                 )
             # Only preprocess if has tokens
             if audio.latent.size > 0:
-                audio_args = self._audio_args_preprocessor.prepare(audio)
+                audio_args = self._audio_args_preprocessor.prepare(audio, video)
             else:
                  # Minimal dummy args (should be handled by block enabled check, but safe fallback)
                 audio_args = TransformerArgs(

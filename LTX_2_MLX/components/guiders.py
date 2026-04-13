@@ -205,6 +205,88 @@ class LegacyStatefulAPGGuider:
         return self.scale != 0.0
 
 
+import math
+
+
+@dataclass(frozen=True)
+class MultiModalGuiderParams:
+    """
+    Parameters for the multi-modal guider.
+
+    Matches PyTorch: ltx_core/components/guiders.py
+    """
+
+    cfg_scale: float = 1.0
+    stg_scale: float = 0.0
+    stg_blocks: Optional[list] = field(default_factory=list)
+    rescale_scale: float = 0.0
+    modality_scale: float = 1.0
+    skip_step: int = 0
+
+
+@dataclass(frozen=True)
+class MultiModalGuider:
+    """
+    Multi-modal guider combining CFG + STG + modality-isolated guidance.
+
+    Performs up to 4 transformer passes per step:
+      1. cond: conditioned prediction
+      2. uncond: unconditioned prediction (for CFG)
+      3. ptb: perturbed prediction (for STG, self-attn skipped)
+      4. mod: modality-isolated prediction (cross-attn skipped)
+
+    Matches PyTorch: ltx_core/components/guiders.py
+    """
+
+    params: MultiModalGuiderParams
+    negative_context: Optional[mx.array] = None
+
+    def calculate(
+        self,
+        cond: mx.array,
+        uncond_text: mx.array,
+        uncond_perturbed: mx.array,
+        uncond_modality: mx.array,
+    ) -> mx.array:
+        """Combine all guidance terms into the final prediction."""
+        # uncond_text/uncond_perturbed/uncond_modality may be 0.0 (float)
+        # when the corresponding pass was not needed
+        pred = cond
+
+        if isinstance(uncond_text, mx.array):
+            pred = pred + (self.params.cfg_scale - 1) * (cond - uncond_text)
+
+        if isinstance(uncond_perturbed, mx.array):
+            pred = pred + self.params.stg_scale * (cond - uncond_perturbed)
+
+        if isinstance(uncond_modality, mx.array):
+            pred = pred + (self.params.modality_scale - 1) * (cond - uncond_modality)
+
+        if self.params.rescale_scale != 0:
+            # Match PyTorch: cond.std() / pred.std()
+            cond_std = mx.sqrt(mx.var(cond) + 1e-8)
+            pred_std = mx.sqrt(mx.var(pred) + 1e-8)
+            factor = cond_std / pred_std
+            factor = self.params.rescale_scale * factor + (1 - self.params.rescale_scale)
+            pred = pred * factor
+
+        return pred
+
+    def do_unconditional_generation(self) -> bool:
+        return not math.isclose(self.params.cfg_scale, 1.0)
+
+    def do_perturbed_generation(self) -> bool:
+        return not math.isclose(self.params.stg_scale, 0.0)
+
+    def do_isolated_modality_generation(self) -> bool:
+        return not math.isclose(self.params.modality_scale, 1.0)
+
+    def should_skip_step(self, step: int) -> bool:
+        if self.params.skip_step == 0:
+            return False
+        return step % (self.params.skip_step + 1) != 0
+
+
 def projection_coef(to_project: mx.array, project_onto: mx.array) -> mx.array:
     """
     Compute the projection coefficient of to_project onto project_onto.

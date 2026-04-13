@@ -5,16 +5,18 @@ This module implements Gemma 3 12B with the ability to extract hidden states
 from all layers, which is required by LTX-2's text encoder pipeline.
 
 Architecture:
-- 48 transformer layers
+- 48 transformer layers (40 sliding attention + 8 full attention)
 - 3840 hidden dimension
 - 16 attention heads (query), 8 KV heads (grouped query attention)
 - 256 head dimension
 - 15360 intermediate (MLP) dimension
-- RoPE with linear scaling (factor 8.0)
+- Two RoPE configs:
+  - Sliding attention: theta=10000, no scaling, window=1024
+  - Full attention: theta=1000000, linear scaling factor 8.0, full sequence
 - RMSNorm with +1 offset
 """
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -22,6 +24,13 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from LTX_2_MLX.kernels import silu_mul
+
+
+# Gemma3 layer type pattern: every 6th layer (5, 11, 17, 23, 29, 35, 41, 47) is full attention
+GEMMA3_LAYER_TYPES = [
+    "sliding_attention" if (i % 6 != 5) else "full_attention"
+    for i in range(48)
+]
 
 
 @dataclass
@@ -36,10 +45,14 @@ class Gemma3Config:
     num_key_value_heads: int = 8
     head_dim: int = 256
     rms_norm_eps: float = 1e-6
-    rope_theta: float = 1000000.0  # Gemma3 uses 10^6, not 10^4
-    rope_scaling_factor: float = 8.0
     max_position_embeddings: int = 131072
     sliding_window: int = 1024
+    # Per-layer-type RoPE parameters (matching HF Gemma3TextConfig.rope_parameters)
+    sliding_rope_theta: float = 10000.0
+    sliding_rope_scaling_factor: float = 1.0  # No scaling for sliding
+    full_rope_theta: float = 1000000.0
+    full_rope_scaling_factor: float = 8.0  # Linear scaling for full attention
+    layer_types: List[str] = field(default_factory=lambda: list(GEMMA3_LAYER_TYPES))
 
 
 def rms_norm(x: mx.array, weight: mx.array, eps: float = 1e-6) -> mx.array:
@@ -64,14 +77,18 @@ class Gemma3RMSNorm(nn.Module):
 
 
 class Gemma3RotaryEmbedding:
-    """Rotary position embeddings for Gemma 3 with linear scaling."""
+    """Rotary position embeddings for Gemma 3.
+
+    Supports both sliding attention (theta=10000, no scaling) and
+    full attention (theta=1000000, linear scaling factor 8.0).
+    """
 
     def __init__(
         self,
         dim: int,
         max_position_embeddings: int = 131072,
         base: float = 10000.0,
-        scaling_factor: float = 8.0,
+        scaling_factor: float = 1.0,
     ):
         self.dim = dim
         self.max_position_embeddings = max_position_embeddings
@@ -84,7 +101,7 @@ class Gemma3RotaryEmbedding:
 
     def __call__(self, positions: mx.array) -> Tuple[mx.array, mx.array]:
         """Compute cos and sin for rotary embeddings."""
-        # Apply linear scaling
+        # Apply linear scaling (1.0 for sliding = no-op, 8.0 for full)
         positions = positions.astype(mx.float32) / self.scaling_factor
 
         # Compute angles: [seq_len] x [dim/2] -> [seq_len, dim/2]
@@ -125,9 +142,10 @@ def apply_rotary_pos_emb(
 class Gemma3Attention(nn.Module):
     """Multi-head attention with grouped query attention for Gemma 3."""
 
-    def __init__(self, config: Gemma3Config):
+    def __init__(self, config: Gemma3Config, layer_type: str = "sliding_attention"):
         super().__init__()
         self.config = config
+        self.layer_type = layer_type
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.num_kv_heads = config.num_key_value_heads
@@ -144,13 +162,23 @@ class Gemma3Attention(nn.Module):
         self.q_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = Gemma3RMSNorm(self.head_dim, eps=config.rms_norm_eps)
 
-        # Rotary embeddings
+        # Per-layer-type rotary embeddings
+        if layer_type == "full_attention":
+            rope_theta = config.full_rope_theta
+            rope_scaling = config.full_rope_scaling_factor
+        else:
+            rope_theta = config.sliding_rope_theta
+            rope_scaling = config.sliding_rope_scaling_factor
+
         self.rotary_emb = Gemma3RotaryEmbedding(
             dim=self.head_dim,
             max_position_embeddings=config.max_position_embeddings,
-            base=config.rope_theta,
-            scaling_factor=config.rope_scaling_factor,
+            base=rope_theta,
+            scaling_factor=rope_scaling,
         )
+
+        # Sliding window size (only used for sliding_attention layers)
+        self.sliding_window = config.sliding_window if layer_type == "sliding_attention" else None
 
         # Attention scale
         self.scale = self.head_dim ** -0.5
@@ -230,9 +258,10 @@ class Gemma3MLP(nn.Module):
 class Gemma3DecoderLayer(nn.Module):
     """Single transformer layer for Gemma 3."""
 
-    def __init__(self, config: Gemma3Config):
+    def __init__(self, config: Gemma3Config, layer_type: str = "sliding_attention"):
         super().__init__()
-        self.self_attn = Gemma3Attention(config)
+        self.layer_type = layer_type
+        self.self_attn = Gemma3Attention(config, layer_type=layer_type)
         self.mlp = Gemma3MLP(config)
 
         # Gemma 3 has 4 layer norms per block
@@ -282,8 +311,11 @@ class Gemma3Model(nn.Module):
         # Embedding scale factor (Gemma multiplies embeddings by sqrt(hidden_size))
         self.embed_scale = config.hidden_size ** 0.5
 
-        # Transformer layers
-        self.layers = [Gemma3DecoderLayer(config) for _ in range(config.num_hidden_layers)]
+        # Transformer layers — each with its own layer type (sliding or full attention)
+        self.layers = [
+            Gemma3DecoderLayer(config, layer_type=config.layer_types[i])
+            for i in range(config.num_hidden_layers)
+        ]
 
         # Final norm
         self.norm = Gemma3RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -322,44 +354,47 @@ class Gemma3Model(nn.Module):
         # Collect hidden states (PyTorch adds hidden states at START of each layer iteration)
         all_hidden_states = [] if output_hidden_states else None
 
-        # Create causal mask if needed
-        if attention_mask is not None:
-            binary_attention_mask = attention_mask
-            # Convert binary mask to additive mask
-            # 1 -> 0, 0 -> -inf
-            causal_mask = mx.triu(
-                mx.full((seq_len, seq_len), float("-inf")),
-                k=1,
-            )
-            # Add padding mask: 1 -> 0, 0 -> -inf
-            # Use mx.where to avoid 0 * -inf = NaN
-            padding_mask = mx.where(
-                binary_attention_mask[:, None, None, :] == 1,
-                mx.zeros((1,)),
-                mx.full((1,), float("-inf")),
-            )
-            # Combine causal and padding masks first
-            combined_mask = causal_mask[None, None, :, :] + padding_mask
+        # Create boolean attention masks — separate for sliding and full attention layers.
+        # Using bool masks (True=attend, False=block) matching HF Gemma3 behavior.
+        # This is critical: additive float masks cause NaN for all-padded rows,
+        # and the "fix" of setting padded rows to attend-all produces different
+        # outputs than HF's bool mask which gracefully handles all-False rows.
+        full_attn_mask = None
+        sliding_attn_mask = None
 
-            # Fix for left-padded sequences: if a query position is padded and would
-            # result in all -inf (can't attend to anything), allow it to attend to
-            # everything to avoid NaN in softmax. This matches PyTorch behavior.
-            # See: https://github.com/pytorch/pytorch/issues/110213
-            query_is_pad = binary_attention_mask[:, None, :, None] == 0
-            attention_mask = mx.where(query_is_pad, mx.zeros_like(combined_mask), combined_mask)
+        if attention_mask is not None:
+            binary_mask = attention_mask  # (B, seq_len), 1=real, 0=pad
+
+            # Causal mask: True where j <= i (can attend to current and past)
+            causal_bool = mx.tril(mx.ones((seq_len, seq_len), dtype=mx.bool_))  # (seq, seq)
+
+            # Padding mask: True where key position is a real token
+            pad_bool = binary_mask[:, None, None, :].astype(mx.bool_)  # (B, 1, 1, seq)
+
+            # Full attention: causal AND not-padded
+            full_attn_mask = (causal_bool[None, None, :, :]) & pad_bool  # (B, 1, seq, seq)
+
+            # Sliding window: additionally restrict to window
+            sw = self.config.sliding_window
+            row_idx = mx.arange(seq_len)[:, None]
+            col_idx = mx.arange(seq_len)[None, :]
+            window_bool = (row_idx - col_idx) < sw  # True if within window
+            sliding_attn_mask = full_attn_mask & window_bool[None, None, :, :]
 
         # Process through layers
         try:
             from tqdm import tqdm
-            layer_iter = tqdm(self.layers, desc="Gemma forward", ncols=80, leave=False)
+            layer_iter = list(enumerate(tqdm(self.layers, desc="Gemma forward", ncols=80, leave=False)))
         except ImportError:
-            layer_iter = self.layers
+            layer_iter = list(enumerate(self.layers))
 
-        for layer in layer_iter:
+        for i, layer in layer_iter:
             # Add hidden states BEFORE each layer (matching PyTorch behavior)
             if output_hidden_states:
                 all_hidden_states.append(hidden_states)
-            hidden_states = layer(hidden_states, attention_mask, position_ids)
+            # Use the correct mask for this layer type
+            layer_mask = sliding_attn_mask if layer.layer_type == "sliding_attention" else full_attn_mask
+            hidden_states = layer(hidden_states, layer_mask, position_ids)
             mx.eval(hidden_states)  # Force eval for progress tracking
 
         # Final norm

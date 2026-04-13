@@ -678,9 +678,16 @@ def decode_latent(
     decoder: SimpleVideoDecoder,
     timestep: Optional[float] = 0.05,
     key: Optional[mx.array] = None,
+    temporal_chunk_size: int = 7,
+    temporal_overlap: int = 2,
 ) -> mx.array:
     """
     Decode latent to video frames.
+
+    Uses temporal chunking for sequences longer than temporal_chunk_size to work
+    around a 3D convolution bug in MLX where early frames of long sequences
+    produce noise artifacts. Chunks are decoded independently and blended in
+    the overlap region using a linear ramp.
 
     Args:
         latent: Latent tensor (B, 128, T, H, W) or (128, T, H, W).
@@ -688,6 +695,8 @@ def decode_latent(
         timestep: Timestep for conditioning (default 0.05 for denoising).
                   Use 0.0 for no denoising, None to disable timestep conditioning.
         key: Optional random key for deterministic decoding (reserved for future use).
+        temporal_chunk_size: Max latent frames per chunk (default 7, proven clean).
+        temporal_overlap: Overlap in latent frames between chunks for blending (default 2).
 
     Returns:
         Video frames as uint8 (T, H, W, 3) in [0, 255].
@@ -696,8 +705,89 @@ def decode_latent(
     if latent.ndim == 4:
         latent = latent[None]
 
-    # Decode with timestep conditioning
-    video = decoder(latent, timestep=timestep)
+    T = latent.shape[2]  # Temporal dim in latent space
+
+    if T <= temporal_chunk_size:
+        # Short enough to decode in one pass
+        video = decoder(latent, timestep=timestep)
+    else:
+        # Tiled temporal decoding: split into overlapping chunks and blend.
+        # This works around a 3D convolution bug in MLX where early frames
+        # of long temporal sequences produce noise artifacts.
+
+        def latent_t_to_pixel_t(lt):
+            """Convert latent temporal dim to pixel frames through 3 upsample stages."""
+            pt = lt
+            for _ in range(3):
+                pt = pt * 2 - 1
+            return pt
+
+        # Compute expected total pixel frames
+        total_pixel_frames = latent_t_to_pixel_t(T)
+
+        stride = temporal_chunk_size - temporal_overlap
+
+        # Decode chunks
+        decoded_chunks = []  # (start_latent, end_latent, decoded_video)
+        t = 0
+        while t < T:
+            end = min(t + temporal_chunk_size, T)
+            # Ensure last chunk is at least overlap+1 frames
+            if end - t < temporal_overlap + 1 and t > 0:
+                t = max(0, end - temporal_chunk_size)
+                end = min(t + temporal_chunk_size, T)
+
+            chunk_latent = latent[:, :, t:end, :, :]
+            chunk_video = decoder(chunk_latent, timestep=timestep)
+            mx.eval(chunk_video)
+            decoded_chunks.append((t, end, chunk_video))
+
+            if end >= T:
+                break
+            t += stride
+
+        if len(decoded_chunks) == 1:
+            # Only one chunk — trim to expected length
+            video = decoded_chunks[0][2][:, :, :total_pixel_frames, :, :]
+        else:
+            # Multiple chunks — stitch with overlap blending.
+            # Compute overlap in pixel space by decoding the overlap latent count
+            # as a standalone chunk to get its exact pixel length.
+            overlap_pixel_ref = latent_t_to_pixel_t(temporal_overlap)
+
+            # Start with the first chunk
+            video = decoded_chunks[0][2]
+
+            for i in range(1, len(decoded_chunks)):
+                curr_start_l, curr_end_l, curr_video = decoded_chunks[i]
+                curr_pixel_len = curr_video.shape[2]
+
+                # The overlap in pixel space
+                overlap_pixels = min(overlap_pixel_ref, curr_pixel_len, video.shape[2])
+
+                if overlap_pixels <= 1:
+                    # No meaningful overlap — just concatenate
+                    video = mx.concatenate([video, curr_video], axis=2)
+                    continue
+
+                # Get overlap regions from both sides
+                prev_overlap = video[:, :, -overlap_pixels:, :, :]
+                curr_overlap = curr_video[:, :, :overlap_pixels, :, :]
+                curr_tail = curr_video[:, :, overlap_pixels:, :, :]
+
+                # Linear crossfade
+                ramp = mx.linspace(0.0, 1.0, overlap_pixels).reshape(1, 1, overlap_pixels, 1, 1)
+                blended = prev_overlap * (1.0 - ramp) + curr_overlap * ramp
+
+                # Stitch: keep everything before overlap, add blend, add tail
+                video = mx.concatenate([
+                    video[:, :, :-overlap_pixels, :, :],
+                    blended,
+                    curr_tail,
+                ], axis=2)
+
+            # Trim to exact expected length
+            video = video[:, :, :total_pixel_frames, :, :]
 
     # Convert to uint8: output is in [-1, 1] (matching PyTorch)
     video = mx.clip((video + 1) / 2, 0, 1) * 255

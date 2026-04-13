@@ -13,6 +13,7 @@ from .encoder import (
     create_av_text_encoder,
     load_av_text_encoder_weights,
     create_av_text_encoder_v2,
+    create_av_text_encoder_v2_from_checkpoint,
     load_av_text_encoder_v2_weights,
 )
 from .feature_extractor import (
@@ -43,5 +44,6 @@ __all__ = [
     "GemmaFeaturesExtractorV2",
     "norm_and_concat_per_token_rms",
     "create_av_text_encoder_v2",
+    "create_av_text_encoder_v2_from_checkpoint",
     "load_av_text_encoder_v2_weights",
 ]

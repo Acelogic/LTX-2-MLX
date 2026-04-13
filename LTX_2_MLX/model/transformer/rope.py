@@ -371,6 +371,7 @@ def precompute_freqs_cis(
     use_middle_indices_grid: bool = False,
     num_attention_heads: int = 32,
     rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
+    use_double_precision: bool = False,
 ) -> Tuple[mx.array, mx.array]:
     """
     Precompute cosine and sine frequencies for RoPE.
@@ -384,6 +385,8 @@ def precompute_freqs_cis(
         use_middle_indices_grid: If True, use middle of position bounds.
         num_attention_heads: Number of attention heads.
         rope_type: Type of RoPE (INTERLEAVED or SPLIT).
+        use_double_precision: Use float64 for frequency grid computation
+            (matches ComfyUI's generate_freq_grid_np). Required for V2.3.
 
     Returns:
         Tuple of (cos_freqs, sin_freqs).
@@ -393,7 +396,10 @@ def precompute_freqs_cis(
 
     # Generate frequency indices
     n_pos_dims = indices_grid.shape[1]
-    indices = generate_freq_grid(theta, n_pos_dims, dim)
+    if use_double_precision:
+        indices = generate_freq_grid_np(theta, n_pos_dims, dim)
+    else:
+        indices = generate_freq_grid(theta, n_pos_dims, dim)
 
     # Generate frequencies from positions
     freqs = generate_freqs(indices, indices_grid, max_pos, use_middle_indices_grid)

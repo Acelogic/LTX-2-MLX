@@ -57,8 +57,8 @@ def conv3d(
     h_out = h_padded - kh + 1
     w_out = w_padded - kw + 1
 
-    # Accumulate output
-    output = mx.zeros((b, out_c, t_out, h_out, w_out))
+    # Accumulate output (match input dtype for bf16 throughput)
+    output = mx.zeros((b, out_c, t_out, h_out, w_out), dtype=x.dtype)
 
     # For each temporal kernel position
     for dt in range(kt):
@@ -441,9 +441,13 @@ def load_spatial_upscaler_weights(upscaler: SpatialUpscaler, weights_path: str) 
 
         for key in key_iter:
             tensor = f.get_tensor(key)
+            # Keep bf16 weights as bf16 (Apple Silicon M5 has native bf16 support)
+            # For older hardware, fall back to fp32
             if tensor.dtype == torch.bfloat16:
-                tensor = tensor.to(torch.float32)
-            value = mx.array(tensor.numpy())
+                # Convert via float32 numpy then cast to bf16 in MLX
+                value = mx.array(tensor.to(torch.float32).numpy()).astype(mx.bfloat16)
+            else:
+                value = mx.array(tensor.numpy())
 
             # Map weights to model
             if key == "initial_conv.weight":
@@ -518,13 +522,14 @@ def _load_res_block_weight(blocks: list, key: str, value: mx.array, prefix: str)
 
 def _load_upsampler_weight(upsampler: SpatialRationalResampler, key: str, value: mx.array) -> int:
     """Load weight into the upsampler. Returns 1 if loaded, 0 otherwise."""
-    # Keys: upsampler.conv.weight, upsampler.conv.bias, upsampler.blur_down.kernel
-    if key == "upsampler.conv.weight":
+    # v1.0 keys: upsampler.conv.weight, upsampler.conv.bias, upsampler.blur_down.kernel
+    # v1.1 keys: upsampler.0.weight, upsampler.0.bias (no blur_down)
+    if key in ("upsampler.conv.weight", "upsampler.0.weight"):
         # PyTorch Conv2d: (out_C, in_C, kH, kW) -> MLX: (out_C, kH, kW, in_C)
         value = value.transpose(0, 2, 3, 1)
         upsampler.conv_weight = value
         return 1
-    elif key == "upsampler.conv.bias":
+    elif key in ("upsampler.conv.bias", "upsampler.0.bias"):
         upsampler.conv_bias = value
         return 1
     elif key == "upsampler.blur_down.kernel":

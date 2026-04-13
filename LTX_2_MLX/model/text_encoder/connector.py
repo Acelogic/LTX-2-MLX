@@ -121,6 +121,7 @@ class Embeddings1DConnector(nn.Module):
         rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
         norm_eps: float = 1e-6,
         apply_gated_attention: bool = False,
+        double_precision_rope: bool = False,
     ):
         """
         Initialize embeddings connector.
@@ -135,6 +136,8 @@ class Embeddings1DConnector(nn.Module):
             rope_type: Type of RoPE.
             norm_eps: Epsilon for normalization.
             apply_gated_attention: Enable per-head gating (V2).
+            double_precision_rope: Use float64 for RoPE frequency computation
+                (matches ComfyUI's generate_freq_grid_np). Required for V2.3.
         """
         super().__init__()
 
@@ -144,6 +147,7 @@ class Embeddings1DConnector(nn.Module):
         self.positional_embedding_max_pos = positional_embedding_max_pos or [1]
         self.rope_type = rope_type
         self.norm_eps = norm_eps
+        self.double_precision_rope = double_precision_rope
 
         # Transformer blocks
         self.transformer_1d_blocks = [
@@ -168,66 +172,60 @@ class Embeddings1DConnector(nn.Module):
                 shape=(num_learnable_registers, self.inner_dim),
             )
 
-    def _replace_padded_with_learnable_registers(
+    def _append_learnable_registers(
         self,
         hidden_states: mx.array,
-        attention_mask: mx.array,
-    ) -> Tuple[mx.array, mx.array]:
+        attention_mask: Optional[mx.array] = None,
+    ) -> Tuple[mx.array, Optional[mx.array]]:
         """
-        Replace padded positions with learnable register tokens.
+        Append learnable register tokens beyond the input sequence.
 
-        This allows the model to process fixed-length sequences while
-        maintaining meaningful content in padded positions.
+        Matches ComfyUI behavior: extends the sequence to at least 1024 tokens
+        (or the next multiple of num_learnable_registers above seq_len) by
+        appending tiled register tokens. Original tokens stay in place — no
+        sorting or replacement. Attention mask is cleared so all positions
+        (including original pad tokens) attend to each other.
 
         Args:
             hidden_states: Input tensor [B, T, D].
-            attention_mask: Additive attention mask.
+            attention_mask: Optional additive attention mask [B, 1, 1, T].
 
         Returns:
-            Tuple of (modified_hidden_states, modified_attention_mask).
+            Tuple of (extended_hidden_states, cleared_attention_mask).
         """
-        seq_len = hidden_states.shape[1]
+        import math
 
-        if seq_len % self.num_learnable_registers != 0:
-            raise ValueError(
-                f"Sequence length {seq_len} must be divisible by "
-                f"num_learnable_registers {self.num_learnable_registers}"
-            )
+        batch_size, seq_len, hidden_dim = hidden_states.shape
 
-        batch_size, _, hidden_dim = hidden_states.shape
+        # Tile registers to cover at least max(1024, seq_len), rounded up to
+        # the next multiple of num_learnable_registers.
+        target_len = max(1024, seq_len)
+        num_duplications = math.ceil(target_len / self.num_learnable_registers)
+        total_register_len = num_duplications * self.num_learnable_registers
 
-        # Tile registers to match sequence length
-        num_duplications = seq_len // self.num_learnable_registers
         tiled_registers = mx.tile(
-            self.learnable_registers[None, :, :],
-            (batch_size, num_duplications, 1),
-        )
+            self.learnable_registers, (num_duplications, 1)
+        )  # [total_register_len, D]
 
-        # Create binary mask from attention mask
-        # attention_mask is additive: 0 = attend, large negative = don't attend
-        mask_squeezed = attention_mask.squeeze(1).squeeze(1)  # [B, T]
-        is_valid = (mask_squeezed >= -9000.0)  # [B, T]
+        # Registers beyond the current sequence length
+        extra_registers = tiled_registers[seq_len:]  # [extra, D]
 
-        # Move valid tokens to the front (matching PyTorch behavior)
-        idx = mx.arange(seq_len, dtype=mx.int32)[None, :]
-        valid_int = is_valid.astype(mx.int32)
-        sort_key = (1 - valid_int) * seq_len + idx
-        order = mx.argsort(sort_key, axis=1)
-        adjusted_hidden_states = mx.take_along_axis(
-            hidden_states, order[:, :, None], axis=1
-        )
-
-        # Flip mask so registers fill the padded tail positions
-        flipped_mask = is_valid.astype(hidden_states.dtype)[:, ::-1, None]
-        hidden_states = (
-            flipped_mask * adjusted_hidden_states
-            + (1 - flipped_mask) * tiled_registers
-        )
+        if extra_registers.shape[0] > 0:
+            # Broadcast to batch: [B, extra, D]
+            extra_batch = mx.broadcast_to(
+                extra_registers[None, :, :],
+                (batch_size, extra_registers.shape[0], hidden_dim),
+            )
+            hidden_states = mx.concatenate([hidden_states, extra_batch], axis=1)
 
         # Clear the attention mask (all positions now valid)
-        new_mask = mx.zeros_like(attention_mask)
+        new_seq_len = hidden_states.shape[1]
+        if attention_mask is not None:
+            attention_mask = mx.zeros(
+                (1, 1, 1, new_seq_len), dtype=attention_mask.dtype
+            )
 
-        return hidden_states, new_mask
+        return hidden_states, attention_mask
 
     def __call__(
         self,
@@ -244,9 +242,9 @@ class Embeddings1DConnector(nn.Module):
         Returns:
             Tuple of (processed_hidden_states, attention_mask).
         """
-        # Replace padded positions with learnable registers
-        if self.num_learnable_registers and attention_mask is not None:
-            hidden_states, attention_mask = self._replace_padded_with_learnable_registers(
+        # Append learnable registers beyond the sequence (matching ComfyUI)
+        if self.num_learnable_registers:
+            hidden_states, attention_mask = self._append_learnable_registers(
                 hidden_states, attention_mask
             )
 
@@ -255,6 +253,8 @@ class Embeddings1DConnector(nn.Module):
         indices_grid = mx.arange(seq_len, dtype=mx.float32)[None, None, :]
 
         # Compute RoPE frequencies
+        # When double_precision_rope is True, use generate_freq_grid_np (float64)
+        # to match ComfyUI's behavior for V2.3 models.
         freqs_cis = precompute_freqs_cis(
             indices_grid=indices_grid,
             dim=self.inner_dim,
@@ -263,6 +263,7 @@ class Embeddings1DConnector(nn.Module):
             max_pos=self.positional_embedding_max_pos,
             num_attention_heads=self.num_attention_heads,
             rope_type=self.rope_type,
+            use_double_precision=self.double_precision_rope,
         )
 
         # Process through transformer blocks

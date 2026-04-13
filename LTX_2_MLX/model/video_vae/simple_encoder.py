@@ -269,10 +269,10 @@ class SimpleVideoEncoder(nn.Module):
     - down_blocks.4: 6 res blocks (512 ch)
     - down_blocks.5: SpaceToDepthDownsample (512 -> 1024, stride (2,2,2))
     - down_blocks.6: 2 res blocks (1024 ch)
-    - down_blocks.7: SpaceToDepthDownsample (1024 -> 2048, stride (2,2,2))
-    - down_blocks.8: 2 res blocks (2048 ch)
+    - down_blocks.7: SpaceToDepthDownsample (1024 -> 1024, stride (2,2,2))
+    - down_blocks.8: 2 res blocks (1024 ch)
     - pixel_norm + SiLU
-    - conv_out: 2048 -> 129 (128 means + 1 uniform logvar)
+    - conv_out: 1024 -> 129 (128 means + 1 uniform logvar)
     - per-channel normalization
 
     Total compression: 1:192 (32x spatial from 8x d2s + 4x patchify, 8x temporal)
@@ -297,11 +297,11 @@ class SimpleVideoEncoder(nn.Module):
         self.down_blocks_4 = EncoderResBlockGroup(512, num_blocks=6)
         self.down_blocks_5 = SpaceToDepthDownsample3d(512, 1024, stride=(2, 2, 2))  # compress_all_res
         self.down_blocks_6 = EncoderResBlockGroup(1024, num_blocks=2)
-        self.down_blocks_7 = SpaceToDepthDownsample3d(1024, 2048, stride=(2, 2, 2))  # compress_all_res
-        self.down_blocks_8 = EncoderResBlockGroup(2048, num_blocks=2)
+        self.down_blocks_7 = SpaceToDepthDownsample3d(1024, 1024, stride=(2, 2, 2))  # compress_all_res
+        self.down_blocks_8 = EncoderResBlockGroup(1024, num_blocks=2)
 
-        # Conv out: 2048 -> 129 (128 means + 1 uniform logvar)
-        self.conv_out = Conv3dSimple(2048, 129)
+        # Conv out: 1024 -> 129 (128 means + 1 uniform logvar)
+        self.conv_out = Conv3dSimple(1024, 129)
 
     def __call__(
         self,
