@@ -1699,7 +1699,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,  # Match LTX-2.3 reference default frame_rate
+            fps=25.0,  # Required for AV: matches PyTorch frame_rate for audio latent shape
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             audio_cfg_scale=audio_cfg_scale if audio_cfg_scale is not None else (1.0 if model_variant == "distilled" else 7.0),
