@@ -38,6 +38,15 @@ console = Console()
 
 # Weight definitions
 WEIGHTS = {
+    "2.3-distilled": {
+        "name": "LTX-2.3 22B Distilled",
+        "description": "Latest model (22B params, 8 steps) - Recommended",
+        "repo": "Lightricks/LTX-2",
+        "filename": "ltx-2.3-22b-distilled.safetensors",
+        "local_path": "weights/ltx-2.3/ltx-2.3-22b-distilled.safetensors",
+        "size": "~46GB",
+        "required": True,
+    },
     "distilled": {
         "name": "LTX-2 19B Distilled",
         "description": "Fast generation (8 steps), recommended for most users",
