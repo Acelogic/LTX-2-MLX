@@ -21,7 +21,7 @@ from LTX_2_MLX.pipelines.common import (
     post_process_latent,
     timesteps_from_mask,
 )
-from LTX_2_MLX.types import VideoLatentShape
+from LTX_2_MLX.types import VideoLatentShape, NATIVE_FPS
 
 
 # ============================================================================
@@ -87,7 +87,7 @@ class TestDistilledConfig:
         assert config.width == 768
         assert config.num_frames == 97
         assert config.seed == 42
-        assert config.fps == 24.0
+        assert config.fps == NATIVE_FPS
 
     def test_invalid_frame_count_raises(self):
         """Test invalid frame counts raise ValueError."""
@@ -278,7 +278,7 @@ class TestVideoLatentShape:
             frames=97,
             height=480,
             width=704,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         latent_shape = VideoLatentShape.from_pixel_shape(

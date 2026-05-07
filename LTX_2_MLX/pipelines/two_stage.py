@@ -49,6 +49,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -96,7 +97,7 @@ class TwoStageCFGConfig:
 
     # Generation parameters
     seed: int = 42
-    fps: float = 25.0  # Match PyTorch default frame_rate for audio latent calculations
+    fps: float = NATIVE_FPS
     num_inference_steps: int = 30
 
     # Guidance parameters (for stage 1) — matching Reddit/ComfyUI working config

@@ -42,6 +42,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -56,7 +57,7 @@ class DistilledConfig:
 
     # Generation parameters
     seed: int = 42
-    fps: float = 25.0  # Match PyTorch default frame_rate
+    fps: float = NATIVE_FPS
 
     # Tiling for VAE decoding
     tiling_config: Optional[TilingConfig] = None

@@ -36,7 +36,7 @@ from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.components.guiders import LtxAPGGuider, LegacyStatefulAPGGuider, STGGuider
 from LTX_2_MLX.components.perturbations import create_batched_stg_config
-from LTX_2_MLX.types import VideoLatentShape
+from LTX_2_MLX.types import VideoLatentShape, NATIVE_FPS
 from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
 from LTX_2_MLX.loader.lora_loader import fuse_lora_into_weights
 from mlx.utils import tree_flatten
@@ -1381,7 +1381,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=NATIVE_FPS,
             num_inference_steps=steps_stage1,
             cfg_scale=cfg_stage1 if cfg_stage1 is not None else cfg_scale,
             guidance_rescale=guidance_rescale,
@@ -1498,7 +1498,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=NATIVE_FPS,
             stage_1_steps=num_steps,
             dtype=compute_dtype,
         )
@@ -1608,7 +1608,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=NATIVE_FPS,
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             dtype=compute_dtype,
@@ -1692,14 +1692,13 @@ def generate_video(
         )
 
         # Create config with audio enabled
-        # NOTE: fps=25.0 matches PyTorch's default frame_rate for audio latent calculations
         # LTX-2.3 reference: video_cfg=3.0, audio_cfg=7.0, rescale=0.7
         av_config = OneStageCFGConfig(
             height=height,
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=25.0,  # Required for AV: matches PyTorch frame_rate for audio latent shape
+            fps=NATIVE_FPS,
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             audio_cfg_scale=audio_cfg_scale if audio_cfg_scale is not None else (1.0 if model_variant == "distilled" else 7.0),
@@ -1820,7 +1819,7 @@ def generate_video(
                 causal_fix=True,
             ).astype(mx.float32)
             # Convert temporal positions from frames to seconds
-            fps = 24.0
+            fps = NATIVE_FPS
             temporal_positions = positions[:, 0:1, ...] / fps
             other_positions = positions[:, 1:, ...]
             positions = mx.concatenate([temporal_positions, other_positions], axis=1)
@@ -2150,20 +2149,18 @@ def generate_video(
         print("\nNote: VAE decoder was not loaded - output is placeholder visualization.")
 
 
-def save_video(frames: list, output_path: str, fps: int = 24, speed: float = 1.0):
+def save_video(frames: list, output_path: str, fps: int = NATIVE_FPS, speed: float = 1.0):
     """Save frames as video using ffmpeg with optional interpolation and speed adjustment.
 
     Args:
         frames: List of frame arrays (H, W, C) in uint8.
         output_path: Output video file path.
-        fps: Target output frame rate. If >24, uses motion interpolation.
+        fps: Target output frame rate. Values above NATIVE_FPS use motion interpolation.
         speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
     """
     import subprocess
     import tempfile
     from PIL import Image
-
-    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2231,7 +2228,7 @@ def save_video_with_audio(
     frames: list,
     audio_waveform: mx.array,
     output_path: str,
-    fps: int = 24,
+    fps: int = NATIVE_FPS,
     speed: float = 1.0,
     audio_sample_rate: int = 24000,
 ):
@@ -2241,7 +2238,7 @@ def save_video_with_audio(
         frames: List of frame arrays (H, W, C) in uint8.
         audio_waveform: Audio waveform tensor (B, 2, samples).
         output_path: Output video file path.
-        fps: Target output frame rate. If >24, uses motion interpolation.
+        fps: Target output frame rate. Values above NATIVE_FPS use motion interpolation.
         speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
         audio_sample_rate: Audio sample rate in Hz.
     """
@@ -2251,8 +2248,6 @@ def save_video_with_audio(
     import tempfile
     import wave
     from PIL import Image
-
-    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames and audio
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2325,7 +2320,7 @@ def save_video_with_audio(
         print("\n  Encoding video with audio...")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(NATIVE_FPS),  # Input is always at native 24fps
+            "-framerate", str(NATIVE_FPS),  # Input is always at native fps
             "-i", os.path.join(tmpdir, "frame_%04d.png"),
             "-i", audio_path,
         ]
@@ -2373,7 +2368,7 @@ def main():
     parser.add_argument("--steps-stage2", type=int, default=3, help="Stage 2 refinement steps for two-stage pipeline")
     parser.add_argument("--cfg-stage1", type=float, default=None, help="Stage 1 CFG (defaults to --cfg value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--fps", type=int, default=24, help="Output video frame rate (default: 24). If >24, uses frame interpolation.")
+    parser.add_argument("--fps", type=int, default=NATIVE_FPS, help=f"Output video frame rate (default: {NATIVE_FPS}). If >{NATIVE_FPS}, uses frame interpolation.")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast)")
     parser.add_argument("--output", type=str, default="outputs/output.mp4", help="Output path")
     parser.add_argument(

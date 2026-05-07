@@ -39,6 +39,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -55,7 +56,7 @@ class KeyframeInterpolationConfig:
     num_inference_steps: int = 30
     cfg_scale: float = 7.5
     seed: int = 42
-    fps: float = 24.0
+    fps: float = NATIVE_FPS
 
     # Two-stage parameters
     use_two_stage: bool = True

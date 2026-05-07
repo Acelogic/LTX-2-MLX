@@ -46,6 +46,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -62,7 +63,7 @@ class TI2VidHQConfig:
     audio_cfg_scale: float = 7.0
     guidance_rescale: float = 0.45
     seed: int = 42
-    fps: float = 25.0
+    fps: float = NATIVE_FPS
 
     # LoRA for stage 2 refinement
     distilled_lora_config: Optional[LoRAConfig] = None

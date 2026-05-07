@@ -43,6 +43,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -57,7 +58,7 @@ class A2VidConfig:
     num_inference_steps: int = 30
     cfg_scale: float = 3.0
     seed: int = 42
-    fps: float = 25.0
+    fps: float = NATIVE_FPS
 
     # LoRA for stage 2 refinement
     distilled_lora_config: Optional[LoRAConfig] = None

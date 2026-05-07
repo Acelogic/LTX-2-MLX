@@ -43,6 +43,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -124,7 +125,7 @@ def preprocess_canny(
 def _save_control_video(
     video_np: np.ndarray,
     output_path: str,
-    fps: float = 24.0,
+    fps: float = NATIVE_FPS,
 ) -> None:
     """Save a control video to disk for debugging/visualization."""
     try:
@@ -251,7 +252,7 @@ class ICLoraConfig:
     stage_1_steps: int = 7  # Distilled model steps
     stage_2_steps: int = 3  # Refinement steps
     seed: int = 42
-    fps: float = 24.0
+    fps: float = NATIVE_FPS
 
     # Tiling
     tiling_config: Optional[TilingConfig] = None
