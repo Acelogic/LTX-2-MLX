@@ -410,7 +410,6 @@ class Gemma3Model(nn.Module):
 def load_gemma3_weights(
     model: Gemma3Model,
     weights_dir: str,
-    use_fp16: bool = True,
 ) -> None:
     """
     Load Gemma 3 weights from safetensors files.
@@ -418,11 +417,7 @@ def load_gemma3_weights(
     Args:
         model: Gemma3Model instance.
         weights_dir: Directory containing model-0000X-of-00005.safetensors files.
-        use_fp16: Whether to use float16 for weights (saves ~50% memory).
     """
-    from safetensors import safe_open
-    import torch
-
     weights_path = Path(weights_dir)
     shard_files = sorted(weights_path.glob("model-*.safetensors"))
 
@@ -437,76 +432,67 @@ def load_gemma3_weights(
         print(f"Loading Gemma 3 weights from {len(shard_files)} shards...")
 
     loaded_count = 0
-    target_dtype = mx.float16 if use_fp16 else mx.float32
 
     for shard_file in shard_iter:
-        with safe_open(str(shard_file), framework="pt") as f:
-            for key in f.keys():
-                tensor = f.get_tensor(key)
+        weights = mx.load(str(shard_file))
 
-                # Convert to float32 first (bfloat16 not directly supported)
-                if tensor.dtype == torch.bfloat16:
-                    tensor = tensor.to(torch.float32)
+        for key, value in weights.items():
+            # Parse key and set weight
+            if key == "language_model.model.embed_tokens.weight":
+                model.embed_tokens.weight = value
+                loaded_count += 1
 
-                # Convert to MLX array with target dtype
-                value = mx.array(tensor.numpy()).astype(target_dtype)
+            elif key == "language_model.model.norm.weight":
+                model.norm.weight = value
+                loaded_count += 1
 
-                # Parse key and set weight
-                if key == "language_model.model.embed_tokens.weight":
-                    model.embed_tokens.weight = value
-                    loaded_count += 1
+            elif key.startswith("language_model.model.layers."):
+                # Parse layer index
+                parts = key.split(".")
+                layer_idx = int(parts[3])
+                layer = model.layers[layer_idx]
 
-                elif key == "language_model.model.norm.weight":
-                    model.norm.weight = value
-                    loaded_count += 1
-
-                elif key.startswith("language_model.model.layers."):
-                    # Parse layer index
-                    parts = key.split(".")
-                    layer_idx = int(parts[3])
-                    layer = model.layers[layer_idx]
-
-                    # Route to correct component
-                    if "self_attn" in key:
-                        attn = layer.self_attn
-                        if "q_proj.weight" in key:
-                            attn.q_proj.weight = value  # No transpose - MLX does x @ W.T
-                        elif "k_proj.weight" in key:
-                            attn.k_proj.weight = value
-                        elif "v_proj.weight" in key:
-                            attn.v_proj.weight = value
-                        elif "o_proj.weight" in key:
-                            attn.o_proj.weight = value
-                        elif "q_norm.weight" in key:
-                            attn.q_norm.weight = value
-                        elif "k_norm.weight" in key:
-                            attn.k_norm.weight = value
-                        else:
-                            continue
-
-                    elif "mlp" in key:
-                        mlp = layer.mlp
-                        if "gate_proj.weight" in key:
-                            mlp.gate_proj.weight = value  # No transpose
-                        elif "up_proj.weight" in key:
-                            mlp.up_proj.weight = value
-                        elif "down_proj.weight" in key:
-                            mlp.down_proj.weight = value
-                        else:
-                            continue
-
-                    elif "input_layernorm.weight" in key:
-                        layer.input_layernorm.weight = value
-                    elif "post_attention_layernorm.weight" in key:
-                        layer.post_attention_layernorm.weight = value
-                    elif "pre_feedforward_layernorm.weight" in key:
-                        layer.pre_feedforward_layernorm.weight = value
-                    elif "post_feedforward_layernorm.weight" in key:
-                        layer.post_feedforward_layernorm.weight = value
+                # Route to correct component
+                if "self_attn" in key:
+                    attn = layer.self_attn
+                    if "q_proj.weight" in key:
+                        attn.q_proj.weight = value  # No transpose - MLX does x @ W.T
+                    elif "k_proj.weight" in key:
+                        attn.k_proj.weight = value
+                    elif "v_proj.weight" in key:
+                        attn.v_proj.weight = value
+                    elif "o_proj.weight" in key:
+                        attn.o_proj.weight = value
+                    elif "q_norm.weight" in key:
+                        attn.q_norm.weight = value
+                    elif "k_norm.weight" in key:
+                        attn.k_norm.weight = value
                     else:
                         continue
 
-                    loaded_count += 1
+                elif "mlp" in key:
+                    mlp = layer.mlp
+                    if "gate_proj.weight" in key:
+                        mlp.gate_proj.weight = value  # No transpose
+                    elif "up_proj.weight" in key:
+                        mlp.up_proj.weight = value
+                    elif "down_proj.weight" in key:
+                        mlp.down_proj.weight = value
+                    else:
+                        continue
+
+                elif "input_layernorm.weight" in key:
+                    layer.input_layernorm.weight = value
+                elif "post_attention_layernorm.weight" in key:
+                    layer.post_attention_layernorm.weight = value
+                elif "pre_feedforward_layernorm.weight" in key:
+                    layer.pre_feedforward_layernorm.weight = value
+                elif "post_feedforward_layernorm.weight" in key:
+                    layer.post_feedforward_layernorm.weight = value
+                else:
+                    continue
+
+                loaded_count += 1
 
     print(f"  Loaded {loaded_count} weight tensors")
 
