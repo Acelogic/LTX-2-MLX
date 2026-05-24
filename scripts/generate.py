@@ -4,6 +4,7 @@
 import argparse
 import gc
 import os
+import math
 import sys
 from pathlib import Path
 
@@ -36,7 +37,7 @@ from LTX_2_MLX.model.video_vae import VideoDecoder, NormLayerType
 from LTX_2_MLX.components import DISTILLED_SIGMA_VALUES, VideoLatentPatchifier, get_sigma_schedule
 from LTX_2_MLX.components.guiders import LtxAPGGuider, LegacyStatefulAPGGuider, STGGuider
 from LTX_2_MLX.components.perturbations import create_batched_stg_config
-from LTX_2_MLX.types import VideoLatentShape
+from LTX_2_MLX.types import VideoLatentShape, NATIVE_FPS
 from LTX_2_MLX.loader import load_transformer_weights, load_av_transformer_weights, LoRAConfig
 from LTX_2_MLX.loader.lora_loader import fuse_lora_into_weights
 from mlx.utils import tree_flatten
@@ -930,11 +931,42 @@ def euler_step_x0(
     return sample.astype(mx.float32) + velocity.astype(mx.float32) * dt
 
 
+def next_valid_frame_count(frame_count: int) -> int:
+    """Round up to the next LTX-valid frame count: 8*k + 1."""
+    if frame_count <= 1:
+        return 1
+    return ((frame_count - 1 + 7) // 8) * 8 + 1
+
+
+def resolve_num_frames(
+    *,
+    num_frames: int,
+    duration_seconds: float | None,
+    fps: float,
+) -> int:
+    """Resolve frame count from explicit frames or duration.
+
+    If duration is provided, ceil() is used so the generated video covers at
+    least the requested duration, then the result is rounded up to 8*k + 1.
+    """
+    if fps <= 0:
+        raise ValueError(f"fps must be positive, got {fps}")
+
+    if duration_seconds is None:
+        return num_frames
+
+    if duration_seconds <= 0:
+        raise ValueError(f"duration must be positive, got {duration_seconds}")
+
+    requested_frames = math.ceil(duration_seconds * fps)
+    return next_valid_frame_count(requested_frames)
+
+
 def generate_video(
     prompt: str,
     height: int = 480,
     width: int = 704,
-    num_frames: int = 97,  # 12 seconds at 8fps after VAE (97 = 1 + 12*8)
+    num_frames: int = 97,  # ~32s at 24fps (97 latent frames → 769 pixel frames via 8x VAE temporal compression)
     num_steps: int = 7,  # Distilled model uses 7 steps
     cfg_scale: float = 5.0,  # Updated default for better semantic quality
     guidance_rescale: float = 0.7,  # Rescale CFG output to prevent variance explosion
@@ -985,7 +1017,7 @@ def generate_video(
     control_strength: float = 0.95,
     save_control: bool = False,
     ge_gamma: float = 0.0,
-    output_fps: int = 24,
+    output_fps: float = NATIVE_FPS,
     output_speed: float = 1.0,
     # IC-LoRA and Keyframe Interpolation
     keyframes: list = None,
@@ -1381,7 +1413,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=output_fps,
             num_inference_steps=steps_stage1,
             cfg_scale=cfg_stage1 if cfg_stage1 is not None else cfg_scale,
             guidance_rescale=guidance_rescale,
@@ -1498,7 +1530,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=output_fps,
             stage_1_steps=num_steps,
             dtype=compute_dtype,
         )
@@ -1608,7 +1640,7 @@ def generate_video(
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=24.0,
+            fps=output_fps,
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             dtype=compute_dtype,
@@ -1692,14 +1724,13 @@ def generate_video(
         )
 
         # Create config with audio enabled
-        # NOTE: fps=25.0 matches PyTorch's default frame_rate for audio latent calculations
         # LTX-2.3 reference: video_cfg=3.0, audio_cfg=7.0, rescale=0.7
         av_config = OneStageCFGConfig(
             height=height,
             width=width,
             num_frames=num_frames,
             seed=seed,
-            fps=25.0,  # Required for AV: matches PyTorch frame_rate for audio latent shape
+            fps=output_fps,
             num_inference_steps=num_steps,
             cfg_scale=cfg_scale,
             audio_cfg_scale=audio_cfg_scale if audio_cfg_scale is not None else (1.0 if model_variant == "distilled" else 7.0),
@@ -1820,7 +1851,7 @@ def generate_video(
                 causal_fix=True,
             ).astype(mx.float32)
             # Convert temporal positions from frames to seconds
-            fps = 24.0
+            fps = output_fps
             temporal_positions = positions[:, 0:1, ...] / fps
             other_positions = positions[:, 1:, ...]
             positions = mx.concatenate([temporal_positions, other_positions], axis=1)
@@ -2150,20 +2181,18 @@ def generate_video(
         print("\nNote: VAE decoder was not loaded - output is placeholder visualization.")
 
 
-def save_video(frames: list, output_path: str, fps: int = 24, speed: float = 1.0):
-    """Save frames as video using ffmpeg with optional interpolation and speed adjustment.
+def save_video(frames: list, output_path: str, fps: float = NATIVE_FPS, speed: float = 1.0):
+    """Save frames as video using ffmpeg with optional speed adjustment.
 
     Args:
         frames: List of frame arrays (H, W, C) in uint8.
         output_path: Output video file path.
-        fps: Target output frame rate. If >24, uses motion interpolation.
+        fps: Generation and output frame rate.
         speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
     """
     import subprocess
     import tempfile
     from PIL import Image
-
-    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2181,26 +2210,17 @@ def save_video(frames: list, output_path: str, fps: int = 24, speed: float = 1.0
         # Build ffmpeg filter chain
         filters = []
 
-        # Speed adjustment (applied first, before interpolation)
+        # Speed adjustment
         # setpts: lower value = faster, higher value = slower
         if speed != 1.0:
             # speed=2.0 means 2x faster, so PTS should be halved
             pts_multiplier = 1.0 / speed
             filters.append(f"setpts={pts_multiplier}*PTS")
-
-        # Frame interpolation if target fps > native
-        if fps > NATIVE_FPS:
-            # minterpolate creates smooth intermediate frames
-            # mi_mode=mci: motion compensated interpolation
-            # mc_mode=aobmc: adaptive overlapped block motion compensation
-            # me_mode=bidir: bidirectional motion estimation
-            filters.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
-
         # Build ffmpeg command
         print("\n  Encoding video...")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(NATIVE_FPS),  # Input is always at native 24fps
+            "-framerate", str(fps),  # Input frame cadence matches generation fps
             "-i", os.path.join(tmpdir, "frame_%04d.png"),
         ]
 
@@ -2208,9 +2228,7 @@ def save_video(frames: list, output_path: str, fps: int = 24, speed: float = 1.0
         if filters:
             filter_str = ",".join(filters)
             cmd.extend(["-vf", filter_str])
-            if fps > NATIVE_FPS:
-                print(f"  Interpolating {NATIVE_FPS}fps → {fps}fps (speed: {speed}x)")
-            elif speed != 1.0:
+            if speed != 1.0:
                 print(f"  Applying speed: {speed}x")
 
         cmd.extend([
@@ -2231,17 +2249,17 @@ def save_video_with_audio(
     frames: list,
     audio_waveform: mx.array,
     output_path: str,
-    fps: int = 24,
+    fps: float = NATIVE_FPS,
     speed: float = 1.0,
     audio_sample_rate: int = 24000,
 ):
-    """Save frames as video with audio using ffmpeg with optional interpolation and speed.
+    """Save frames as video with audio using ffmpeg with optional speed adjustment.
 
     Args:
         frames: List of frame arrays (H, W, C) in uint8.
         audio_waveform: Audio waveform tensor (B, 2, samples).
         output_path: Output video file path.
-        fps: Target output frame rate. If >24, uses motion interpolation.
+        fps: Generation and output frame rate.
         speed: Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast).
         audio_sample_rate: Audio sample rate in Hz.
     """
@@ -2251,8 +2269,6 @@ def save_video_with_audio(
     import tempfile
     import wave
     from PIL import Image
-
-    NATIVE_FPS = 24  # Model generates motion at 24fps
 
     # Create temp directory for frames and audio
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -2298,14 +2314,10 @@ def save_video_with_audio(
         # Build video filter chain
         video_filters = []
 
-        # Speed adjustment for video (applied first, before interpolation)
+        # Speed adjustment for video
         if speed != 1.0:
             pts_multiplier = 1.0 / speed
             video_filters.append(f"setpts={pts_multiplier}*PTS")
-
-        # Frame interpolation if target fps > native
-        if fps > NATIVE_FPS:
-            video_filters.append(f"minterpolate=fps={fps}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
 
         # Build audio filter chain for speed adjustment
         # atempo filter range is 0.5-2.0, so chain multiple for extreme speeds
@@ -2325,7 +2337,7 @@ def save_video_with_audio(
         print("\n  Encoding video with audio...")
         cmd = [
             "ffmpeg", "-y",
-            "-framerate", str(NATIVE_FPS),  # Input is always at native 24fps
+            "-framerate", str(fps),  # Input frame cadence matches generation fps
             "-i", os.path.join(tmpdir, "frame_%04d.png"),
             "-i", audio_path,
         ]
@@ -2333,9 +2345,7 @@ def save_video_with_audio(
         # Add video filter chain if needed
         if video_filters:
             cmd.extend(["-vf", ",".join(video_filters)])
-            if fps > NATIVE_FPS:
-                print(f"  Interpolating {NATIVE_FPS}fps → {fps}fps (speed: {speed}x)")
-            elif speed != 1.0:
+            if speed != 1.0:
                 print(f"  Applying speed: {speed}x")
 
         # Add audio filter chain if needed
@@ -2366,6 +2376,7 @@ def main():
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument("--width", type=int, default=704, help="Video width")
     parser.add_argument("--frames", type=int, default=97, help="Number of frames")
+    parser.add_argument("--duration", type=float, default=None, help="Duration in seconds. Overrides --frames and rounds up to the next valid 8*k+1 frame count.")
     parser.add_argument("--steps", type=int, default=8, help="Denoising steps (8 for distilled, 15+ for two-stage)")
     parser.add_argument("--cfg", type=float, default=5.0, help="CFG scale (default 5.0 for better semantic quality)")
     parser.add_argument("--guidance-rescale", type=float, default=0.7, help="Guidance rescale factor (0.0=off, 0.7=default, 1.0=full)")
@@ -2373,7 +2384,7 @@ def main():
     parser.add_argument("--steps-stage2", type=int, default=3, help="Stage 2 refinement steps for two-stage pipeline")
     parser.add_argument("--cfg-stage1", type=float, default=None, help="Stage 1 CFG (defaults to --cfg value)")
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
-    parser.add_argument("--fps", type=int, default=24, help="Output video frame rate (default: 24). If >24, uses frame interpolation.")
+    parser.add_argument("--fps", type=float, default=NATIVE_FPS, help=f"Generation and output frame rate (default: {NATIVE_FPS}).")
     parser.add_argument("--speed", type=float, default=1.0, help="Playback speed multiplier (0.5=slow-mo, 1.0=normal, 2.0=fast)")
     parser.add_argument("--output", type=str, default="outputs/output.mp4", help="Output path")
     parser.add_argument(
@@ -2655,6 +2666,17 @@ def main():
             args.weights = args.weights.replace(".safetensors", "-fp8.safetensors")
             print(f"Using FP8 weights: {args.weights}")
 
+    resolved_num_frames = resolve_num_frames(
+        num_frames=args.frames,
+        duration_seconds=args.duration,
+        fps=args.fps,
+    )
+    if args.duration is not None:
+        print(
+            f"Resolved duration {args.duration}s at {args.fps}fps "
+            f"to {resolved_num_frames} frames"
+        )
+
     generate_video(
         distilled_lora=args.distilled_lora,
         distilled_lora_scale=args.distilled_lora_scale,
@@ -2662,7 +2684,7 @@ def main():
         prompt=args.prompt,
         height=args.height,
         width=args.width,
-        num_frames=args.frames,
+        num_frames=resolved_num_frames,
         num_steps=args.steps,
         cfg_scale=args.cfg,
         guidance_rescale=getattr(args, 'guidance_rescale', 0.7),

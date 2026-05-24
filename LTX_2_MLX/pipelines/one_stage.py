@@ -46,6 +46,7 @@ from ..types import (
     LatentState,
     VideoLatentShape,
     VideoPixelShape,
+    NATIVE_FPS
 )
 
 
@@ -60,7 +61,7 @@ class OneStageCFGConfig:
 
     # Generation parameters
     seed: int = 42
-    fps: float = 24.0  # Restore MLX known-good short-clip baseline
+    fps: float = NATIVE_FPS
     num_inference_steps: int = 30
 
     # CFG parameters (matching LTX-2.3 reference defaults)

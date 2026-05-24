@@ -214,7 +214,7 @@ class AudioLatentTools:
             LatentState(
                 latent=initial_latent,
                 denoise_mask=denoise_mask,
-                positions=latent_coords.astype(dtype),
+                positions=latent_coords, # keep float32; downcasting to fp16 causes echo artifacts
                 clean_latent=clean_latent,
             )
         )

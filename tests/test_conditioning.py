@@ -13,7 +13,7 @@ from LTX_2_MLX.components.patchifiers import VideoLatentPatchifier
 from LTX_2_MLX.conditioning.keyframe import VideoConditionByKeyframeIndex
 from LTX_2_MLX.conditioning.latent import VideoConditionByLatentIndex, ConditioningError
 from LTX_2_MLX.conditioning.tools import VideoLatentTools
-from LTX_2_MLX.types import LatentState, VideoLatentShape
+from LTX_2_MLX.types import LatentState, VideoLatentShape, NATIVE_FPS
 
 
 class TestVideoConditionByLatentIndex:
@@ -35,7 +35,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         # Create initial state
@@ -71,7 +71,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -116,7 +116,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -148,7 +148,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -179,7 +179,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -210,7 +210,7 @@ class TestVideoConditionByLatentIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -255,7 +255,7 @@ class TestVideoConditionByKeyframeIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -289,7 +289,7 @@ class TestVideoConditionByKeyframeIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -331,7 +331,7 @@ class TestVideoConditionByKeyframeIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -363,7 +363,7 @@ class TestVideoConditionByKeyframeIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         initial_state = tools.create_initial_state(dtype=mx.float32)
@@ -395,7 +395,7 @@ class TestVideoConditionByKeyframeIndex:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         state = tools.create_initial_state(dtype=mx.float32)
@@ -443,7 +443,7 @@ class TestVideoLatentTools:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         state = tools.create_initial_state(dtype=mx.float32)
@@ -471,7 +471,7 @@ class TestVideoLatentTools:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         # Create custom latent
@@ -496,7 +496,7 @@ class TestVideoLatentTools:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         # Create state and add keyframe
@@ -530,7 +530,7 @@ class TestVideoLatentTools:
         tools = VideoLatentTools(
             patchifier=patchifier,
             target_shape=target_shape,
-            fps=24.0,
+            fps=NATIVE_FPS,
         )
 
         state = tools.create_initial_state(dtype=mx.float32)

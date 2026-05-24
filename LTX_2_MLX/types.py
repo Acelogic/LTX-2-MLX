@@ -6,6 +6,9 @@ from typing import NamedTuple, Tuple
 
 import mlx.core as mx
 
+# LTX-2 native frame rate. Matches frame_rate in the official Lightricks PipelineParams.
+# See: https://github.com/Lightricks/LTX-2/blob/main/packages/ltx-pipelines/src/ltx_pipelines/utils/constants.py
+NATIVE_FPS: float = 24.0
 
 class VideoPixelShape(NamedTuple):
     """
@@ -17,7 +20,7 @@ class VideoPixelShape(NamedTuple):
     frames: int
     height: int
     width: int
-    fps: float = 25.0
+    fps: float
 
 
 class SpatioTemporalScaleFactors(NamedTuple):
@@ -140,7 +143,7 @@ class AudioLatentShape(NamedTuple):
         return AudioLatentShape(
             batch=batch,
             channels=channels,
-            frames=round(duration * latents_per_second),
+            frames=math.ceil(duration * latents_per_second),  # ceil ensures audio covers full video duration; round() can drop the last frame
             mel_bins=mel_bins,
         )
 
