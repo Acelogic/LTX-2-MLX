@@ -373,10 +373,9 @@ def encode_with_gemma(
     print(f"  Loading Gemma 3 model...")
     config = Gemma3Config()
     gemma = Gemma3Model(config)
-    # IMPORTANT: Use FP32 for Gemma - the model was trained with BF16 which has
-    # the same exponent range as FP32. Using FP16 causes numerical overflow due to
-    # the large RMSNorm weights (mean ~6.9x scale factor).
-    load_gemma3_weights(gemma, gemma_path, use_fp16=False)
+    
+    # Weights load in their native bfloat16 via mx.load() - no dtype conversion needed.
+    load_gemma3_weights(gemma, gemma_path)
 
     print(f"  Loading text encoder projection...")
     text_encoder = create_text_encoder()
@@ -542,7 +541,7 @@ def encode_av_gemma_batch(
     print(f"  Loading Gemma 3 model...")
     config = Gemma3Config()
     gemma = Gemma3Model(config)
-    load_gemma3_weights(gemma, gemma_path, use_fp16=False)
+    load_gemma3_weights(gemma, gemma_path)
 
     print(f"  Loading AV text encoder projection...")
     if is_v2_model(ltx_weights_path):
